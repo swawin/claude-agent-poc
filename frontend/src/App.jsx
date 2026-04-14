@@ -27,7 +27,7 @@ export default function App() {
 
       const data = await response.json();
       if (!response.ok) {
-        throw new Error(data.error || 'Request failed');
+        throw new Error(data.details ? `${data.error} ${data.details}` : data.error || 'Request failed');
       }
 
       setResult(data.result || '');
@@ -35,11 +35,15 @@ export default function App() {
       setMetadata(data.metadata || null);
     } catch (err) {
       setError(err.message || 'Unexpected error');
+      setResult('');
+      setLogs([]);
       setMetadata(null);
     } finally {
       setLoading(false);
     }
   }
+
+  const warnings = Array.isArray(metadata?.warnings) ? metadata.warnings : [];
 
   return (
     <main className="container">
@@ -69,6 +73,18 @@ export default function App() {
 
       {error && <p className="error">Error: {error}</p>}
 
+      {metadata?.execution_mode && (
+        <p>
+          <strong>Execution mode:</strong> {metadata.execution_mode}
+        </p>
+      )}
+
+      {metadata?.fallback_plan_used && (
+        <p>
+          <em>Note: Claude planning was unavailable, so a backend fallback plan was used.</em>
+        </p>
+      )}
+
       <section>
         <h2>Execution Steps</h2>
         {logs.length === 0 ? (
@@ -96,6 +112,17 @@ export default function App() {
         <h2>Metadata</h2>
         {metadata ? <pre>{JSON.stringify(metadata, null, 2)}</pre> : <p>No metadata yet.</p>}
       </section>
+
+      {warnings.length > 0 && (
+        <section>
+          <h2>Warnings</h2>
+          <ul>
+            {warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </section>
+      )}
     </main>
   );
 }
