@@ -1,0 +1,48 @@
+:root {
+  font-family: Inter, system-ui, Arial, sans-serif;
+  color: #111;
+  background: #f4f5f7;
+}
+
+body {
+  margin: 0;
+}
+
+.container {
+  max-width: 800px;
+  margin: 2rem auto;
+  background: #fff;
+  padding: 1.5rem;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+}
+
+label {
+  display: block;
+  margin-bottom: 1rem;
+}
+
+input {
+  display: block;
+  width: 100%;
+  margin-top: 0.4rem;
+  padding: 0.6rem;
+  box-sizing: border-box;
+}
+
+button {
+  padding: 0.7rem 1rem;
+  margin-bottom: 1rem;
+}
+
+pre {
+  background: #f8f9fb;
+  padding: 0.8rem;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.error {
+  color: #c62828;
+}
