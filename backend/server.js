@@ -14,24 +14,13 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY
 });
 
-function buildPrompt(task, csvText) {
-  return [
-    'You are a data operations assistant.',
-    'Given a user task and optional CSV data, do the following:',
-    '1) Analyze the CSV content (if provided).',
-    '2) Describe clear cleaning/transformation steps.',
-    '3) Produce a cleaned version of the data in plain text (CSV text is preferred).',
-    '4) Provide a short summary of what was done.',
-    '',
-    'Return strictly valid JSON with this shape:',
-    '{"logs": ["..."], "result": "...", "summary": "..."}',
-    '',
-    `Task: ${task || '(no task provided)'}`,
-    '',
-    'CSV input:',
-    csvText ? csvText : '(no CSV uploaded)'
-  ].join('\n');
-}
+const STEP_LOGS = [
+  'Analyzing input...',
+  'Planning transformation...',
+  'Executing cleaning...',
+  'Validating output...',
+  'Finalizing result...'
+];
 
 function parseClaudeJSON(text) {
   try {
@@ -41,6 +30,77 @@ function parseClaudeJSON(text) {
     if (!match) throw new Error('Claude response did not include JSON');
     return JSON.parse(match[0]);
   }
+}
+
+function getCSVStats(csvText) {
+  if (!csvText.trim()) {
+    return {
+      rowsProcessed: 0,
+      duplicatesRemoved: 0,
+      uniqueRowsCount: 0,
+      hasData: false
+    };
+  }
+
+  const lines = csvText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return {
+      rowsProcessed: 0,
+      duplicatesRemoved: 0,
+      uniqueRowsCount: 0,
+      hasData: false
+    };
+  }
+
+  const dataRows = lines.slice(1);
+  const uniqueRows = new Set(dataRows);
+
+  return {
+    rowsProcessed: dataRows.length,
+    duplicatesRemoved: Math.max(0, dataRows.length - uniqueRows.size),
+    uniqueRowsCount: uniqueRows.size,
+    hasData: true
+  };
+}
+
+async function callClaudeStep(task, csvText, stepName, instruction, context) {
+  const message = await anthropic.messages.create({
+    model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-5',
+    max_tokens: 1200,
+    temperature: 0,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          'You are running one step in a multi-step data execution loop.',
+          `Current step: ${stepName}`,
+          '',
+          `Task: ${task || '(no task provided)'}`,
+          '',
+          'CSV input:',
+          csvText ? csvText : '(no CSV uploaded)',
+          '',
+          'Context from previous steps:',
+          context ? JSON.stringify(context, null, 2) : '{}',
+          '',
+          instruction,
+          '',
+          'Return strictly valid JSON only.'
+        ].join('\n')
+      }
+    ]
+  });
+
+  const textBlock = message.content.find((part) => part.type === 'text');
+  if (!textBlock) {
+    throw new Error(`No text response from Claude in step: ${stepName}`);
+  }
+
+  return parseClaudeJSON(textBlock.text);
 }
 
 app.get('/health', (_req, res) => {
@@ -64,32 +124,78 @@ app.post('/execute', upload.single('file'), async (req, res) => {
       });
     }
 
-    const message = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-5',
-      max_tokens: 2000,
-      temperature: 0,
-      messages: [
-        {
-          role: 'user',
-          content: buildPrompt(task, csvText)
-        }
-      ]
-    });
+    const logs = [];
+    const csvStats = getCSVStats(csvText);
 
-    const textBlock = message.content.find((part) => part.type === 'text');
-    if (!textBlock) {
-      return res.status(500).json({ error: 'No text response from Claude.' });
-    }
+    logs.push(STEP_LOGS[0]);
+    const analysis = await callClaudeStep(
+      task,
+      csvText,
+      'Analyze task and input data',
+      'Analyze the request. Return JSON with: {"input_summary":"...","detected_issues":["..."],"estimated_transformations":["..."]}.',
+      { csv_stats: csvStats }
+    );
 
-    const parsed = parseClaudeJSON(textBlock.text);
+    logs.push(STEP_LOGS[1]);
+    const plan = await callClaudeStep(
+      task,
+      csvText,
+      'Plan actions',
+      'Create an execution plan. Return JSON with: {"plan":["step..."],"transformations_applied":["..."]}.',
+      { analysis, csv_stats: csvStats }
+    );
 
-    const logs = Array.isArray(parsed.logs) ? parsed.logs : [];
-    const result = typeof parsed.result === 'string' ? parsed.result : '';
-    const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
+    logs.push(STEP_LOGS[2]);
+    const execution = await callClaudeStep(
+      task,
+      csvText,
+      'Execute transformation',
+      'Simulate or perform transformation and return JSON with: {"cleaned_output":"...","execution_notes":["..."]}.',
+      { analysis, plan, csv_stats: csvStats }
+    );
+
+    logs.push(STEP_LOGS[3]);
+    const validation = await callClaudeStep(
+      task,
+      csvText,
+      'Validate result',
+      'Validate the transformed output. Return JSON with: {"validation_summary":"...","is_valid":true,"quality_checks":["..."]}.',
+      { analysis, plan, execution, csv_stats: csvStats }
+    );
+
+    logs.push(STEP_LOGS[4]);
+    const finalization = await callClaudeStep(
+      task,
+      csvText,
+      'Produce final output',
+      'Produce final concise output. Return JSON with: {"result":"...","summary":"..."}.',
+      { analysis, plan, execution, validation, csv_stats: csvStats }
+    );
+
+    const transformationsApplied = Array.isArray(plan.transformations_applied)
+      ? plan.transformations_applied
+      : Array.isArray(analysis.estimated_transformations)
+        ? analysis.estimated_transformations
+        : [];
+
+    const resultBody =
+      typeof finalization.result === 'string' && finalization.result.trim()
+        ? finalization.result
+        : typeof execution.cleaned_output === 'string'
+          ? execution.cleaned_output
+          : '';
+
+    const summary = typeof finalization.summary === 'string' ? finalization.summary : '';
 
     return res.json({
-      result: summary ? `${result}\n\nSummary:\n${summary}` : result,
-      logs
+      result: summary ? `${resultBody}\n\nSummary:\n${summary}` : resultBody,
+      logs,
+      metadata: {
+        rows_processed: csvStats.rowsProcessed,
+        duplicates_removed: csvStats.duplicatesRemoved,
+        transformations_applied: transformationsApplied,
+        validation_passed: validation.is_valid !== false
+      }
     });
   } catch (error) {
     console.error(error);

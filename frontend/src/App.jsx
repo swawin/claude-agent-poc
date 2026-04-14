@@ -7,6 +7,7 @@ export default function App() {
   const [file, setFile] = useState(null);
   const [result, setResult] = useState('');
   const [logs, setLogs] = useState([]);
+  const [metadata, setMetadata] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -31,8 +32,10 @@ export default function App() {
 
       setResult(data.result || '');
       setLogs(Array.isArray(data.logs) ? data.logs : []);
+      setMetadata(data.metadata || null);
     } catch (err) {
       setError(err.message || 'Unexpected error');
+      setMetadata(null);
     } finally {
       setLoading(false);
     }
@@ -67,21 +70,31 @@ export default function App() {
       {error && <p className="error">Error: {error}</p>}
 
       <section>
+        <h2>Execution Steps</h2>
+        {logs.length === 0 ? (
+          <p>No logs yet.</p>
+        ) : (
+          <ol className="step-list">
+            {logs.map((log, idx) => (
+              <li className="step-item" key={`${idx}-${log}`}>
+                <span className="step-dot" aria-hidden="true">
+                  {idx + 1}
+                </span>
+                <span>{log}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+
+      <section>
         <h2>Output</h2>
         <pre>{result || 'No output yet.'}</pre>
       </section>
 
       <section>
-        <h2>Logs</h2>
-        {logs.length === 0 ? (
-          <p>No logs yet.</p>
-        ) : (
-          <ol>
-            {logs.map((log, idx) => (
-              <li key={`${idx}-${log}`}>{log}</li>
-            ))}
-          </ol>
-        )}
+        <h2>Metadata</h2>
+        {metadata ? <pre>{JSON.stringify(metadata, null, 2)}</pre> : <p>No metadata yet.</p>}
       </section>
     </main>
   );
