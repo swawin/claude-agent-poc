@@ -3,7 +3,7 @@
 A minimal full-stack demo app:
 - **Frontend:** React + Vite (deployable to Vercel)
 - **Backend:** Node.js + Express (deployable to Railway)
-- **Feature:** Submit a task and optional CSV file; backend calls Claude to clean/transform data and return result + logs.
+- **Feature:** Submit a task and optional CSV file; backend runs a simulated multi-step execution loop with Claude and returns result + logs + metadata.
 
 ## Project structure
 
@@ -63,7 +63,18 @@ Response:
 ```json
 {
   "result": "...cleaned output...",
-  "logs": ["step 1...", "step 2..."]
+  "logs": [
+    "Analyzing input...",
+    "Planning transformation...",
+    "Executing cleaning...",
+    "Validating output...",
+    "Finalizing result..."
+  ],
+  "metadata": {
+    "rows_processed": 0,
+    "duplicates_removed": 0,
+    "transformations_applied": ["..."]
+  }
 }
 ```
 
