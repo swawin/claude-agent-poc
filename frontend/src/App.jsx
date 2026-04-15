@@ -2,12 +2,25 @@ import { useState } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
+const EXECUTION_MODES = {
+  deterministic: {
+    label: 'Deterministic Execution',
+    endpoint: '/execute'
+  },
+  dynamic: {
+    label: 'Dynamic Claude Execution',
+    endpoint: '/execute-dynamic'
+  }
+};
+
 export default function App() {
   const [task, setTask] = useState('Clean this CSV and standardize columns.');
   const [file, setFile] = useState(null);
+  const [executionMode, setExecutionMode] = useState('deterministic');
   const [result, setResult] = useState('');
   const [logs, setLogs] = useState([]);
   const [metadata, setMetadata] = useState(null);
+  const [artifacts, setArtifacts] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -20,7 +33,8 @@ export default function App() {
       formData.append('task', task);
       if (file) formData.append('file', file);
 
-      const response = await fetch(`${API_BASE}/execute`, {
+      const endpoint = EXECUTION_MODES[executionMode].endpoint;
+      const response = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         body: formData
       });
@@ -33,11 +47,13 @@ export default function App() {
       setResult(data.result || '');
       setLogs(Array.isArray(data.logs) ? data.logs : []);
       setMetadata(data.metadata || null);
+      setArtifacts(data.artifacts || null);
     } catch (err) {
       setError(err.message || 'Unexpected error');
       setResult('');
       setLogs([]);
       setMetadata(null);
+      setArtifacts(null);
     } finally {
       setLoading(false);
     }
@@ -59,7 +75,7 @@ export default function App() {
       </label>
 
       <label>
-        CSV Upload (optional)
+        CSV Upload (optional for deterministic, required for dynamic demo)
         <input
           type="file"
           accept=".csv,text/csv"
@@ -67,8 +83,16 @@ export default function App() {
         />
       </label>
 
+      <label>
+        Execution Mode
+        <select value={executionMode} onChange={(e) => setExecutionMode(e.target.value)}>
+          <option value="deterministic">Deterministic Execution</option>
+          <option value="dynamic">Dynamic Claude Execution</option>
+        </select>
+      </label>
+
       <button onClick={runTask} disabled={loading}>
-        {loading ? 'Running...' : 'Run Task'}
+        {loading ? 'Running...' : `Run (${EXECUTION_MODES[executionMode].label})`}
       </button>
 
       {error && <p className="error">Error: {error}</p>}
@@ -76,6 +100,18 @@ export default function App() {
       {metadata?.execution_mode && (
         <p>
           <strong>Execution mode:</strong> {metadata.execution_mode}
+        </p>
+      )}
+
+      {typeof metadata?.iterations_used === 'number' && (
+        <p>
+          <strong>Iterations used:</strong> {metadata.iterations_used}
+        </p>
+      )}
+
+      {typeof metadata?.validation_passed === 'boolean' && (
+        <p>
+          <strong>Validation status:</strong> {metadata.validation_passed ? 'Passed' : 'Failed'}
         </p>
       )}
 
@@ -107,6 +143,20 @@ export default function App() {
         <h2>Output</h2>
         <pre>{result || 'No output yet.'}</pre>
       </section>
+
+      {artifacts?.plan && (
+        <section>
+          <h2>Agent Plan</h2>
+          <pre>{artifacts.plan}</pre>
+        </section>
+      )}
+
+      {artifacts?.generated_code && (
+        <section>
+          <h2>Generated Code (Excerpt)</h2>
+          <pre>{artifacts.generated_code}</pre>
+        </section>
+      )}
 
       <section>
         <h2>Metadata</h2>

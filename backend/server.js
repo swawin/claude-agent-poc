@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import { processCsv } from './lib/csvProcessor.js';
+import { executeDynamicCsvTask } from './lib/dynamicExecutionService.js';
 import {
   advisoryResponse,
   generateSummaryWithClaude,
@@ -119,6 +120,27 @@ app.post('/execute', upload.single('file'), async (req, res) => {
     console.error(error);
     return res.status(500).json({
       error: 'Execution failed.',
+      details: error?.message || 'Unknown error'
+    });
+  }
+});
+
+
+app.post('/execute-dynamic', upload.single('file'), async (req, res) => {
+  try {
+    const task = (req.body.task || '').trim();
+    const response = await executeDynamicCsvTask({
+      task,
+      fileBuffer: req.file?.buffer,
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      model: process.env.CLAUDE_MODEL
+    });
+
+    return res.json(response);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: 'Dynamic execution failed.',
       details: error?.message || 'Unknown error'
     });
   }
