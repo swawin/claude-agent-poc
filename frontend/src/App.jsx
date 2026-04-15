@@ -21,6 +21,7 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [metadata, setMetadata] = useState(null);
   const [artifacts, setArtifacts] = useState(null);
+  const [debug, setDebug] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -48,18 +49,21 @@ export default function App() {
       setLogs(Array.isArray(data.logs) ? data.logs : []);
       setMetadata(data.metadata || null);
       setArtifacts(data.artifacts || null);
+      setDebug(data.debug || null);
     } catch (err) {
       setError(err.message || 'Unexpected error');
       setResult('');
       setLogs([]);
       setMetadata(null);
       setArtifacts(null);
+      setDebug(null);
     } finally {
       setLoading(false);
     }
   }
 
   const warnings = Array.isArray(metadata?.warnings) ? metadata.warnings : [];
+  const isPartialDynamic = metadata?.execution_mode === 'dynamic_agent_execution_partial';
 
   return (
     <main className="container">
@@ -100,6 +104,12 @@ export default function App() {
       {metadata?.execution_mode && (
         <p>
           <strong>Execution mode:</strong> {metadata.execution_mode}
+        </p>
+      )}
+
+      {isPartialDynamic && (
+        <p>
+          <em>Partial dynamic response returned. Review warnings and debug details below.</em>
         </p>
       )}
 
@@ -171,6 +181,18 @@ export default function App() {
               <li key={warning}>{warning}</li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {(debug || isPartialDynamic) && (
+        <section>
+          <h2>Dynamic Debug</h2>
+          {debug?.parser_error && (
+            <p>
+              <strong>Parser error:</strong> {debug.parser_error}
+            </p>
+          )}
+          {debug ? <pre>{JSON.stringify(debug, null, 2)}</pre> : <p>No debug payload returned.</p>}
         </section>
       )}
     </main>
