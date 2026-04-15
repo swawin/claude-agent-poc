@@ -136,6 +136,20 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
 
   const anthropic = new Anthropic({ apiKey });
   const allWarnings = [];
+  const anthropicTools = [
+    {
+      type: 'code_execution_20250522',
+      name: 'code_execution'
+    }
+  ];
+  const debug = {
+    anthropic_tools_sent: anthropicTools.map((tool) => tool.type || tool.name).filter(Boolean),
+    tool_use_detected: false,
+    tool_result_detected: false,
+    tool_use_count: 0,
+    tool_result_count: 0,
+    raw_stop_reason: null
+  };
 
   let finalPayload = null;
   let validation = null;
@@ -154,12 +168,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
         max_tokens: 1800,
         temperature: 0,
         system: buildSystemPrompt(),
-        tools: [
-          {
-            type: 'code_execution_20250522',
-            name: 'code_execution'
-          }
-        ],
+        tools: anthropicTools,
         messages: [
           {
             role: 'user',
@@ -180,6 +189,16 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     }
 
     const content = Array.isArray(message.content) ? message.content : [];
+    const toolUseCount = content.filter((block) => block?.type === 'tool_use').length;
+    const toolResultCount = content.filter((block) => block?.type === 'tool_result').length;
+    debug.tool_use_count += toolUseCount;
+    debug.tool_result_count += toolResultCount;
+    debug.tool_use_detected = debug.tool_use_count > 0;
+    debug.tool_result_detected = debug.tool_result_count > 0;
+    if (typeof message?.stop_reason === 'string') {
+      debug.raw_stop_reason = message.stop_reason;
+    }
+
     if (hasCodeToolSignals(content)) {
       codeToolUsed = true;
     }
@@ -244,6 +263,11 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     allWarnings.push('No explicit code-execution tool output detected; verify Anthropic tool availability.');
   }
 
+  console.log('[execute-dynamic] anthropic_tools_sent:', debug.anthropic_tools_sent);
+  console.log('[execute-dynamic] tool_use_detected:', debug.tool_use_detected);
+  console.log('[execute-dynamic] tool_result_detected:', debug.tool_result_detected);
+  console.log('[execute-dynamic] raw_stop_reason:', debug.raw_stop_reason);
+
   const inputRows = validation.rows_input ?? getInputRowCount(csvText);
 
   return {
@@ -265,6 +289,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
         ? String(finalPayload.generated_code_excerpt).slice(0, 1200)
         : undefined,
       plan: finalPayload.plan
-    }
+    },
+    debug
   };
 }
