@@ -3,23 +3,31 @@ import { validateDynamicCsvResult, getInputRowCount } from './dynamicValidation.
 
 const MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = 'claude-sonnet-4-5';
+const MAX_RAW_EXCERPT = 700;
+
 
 function extractTextBlocks(content) {
   return content
-    .filter((block) => block.type === 'text')
+    .filter((block) => block?.type === 'text' && typeof block?.text === 'string')
     .map((block) => block.text)
     .join('\n')
     .trim();
 }
 
-function hasCodeToolSignals(content) {
-  return content.some((block) =>
-    block.type === 'server_tool_use' ||
-    block.type === 'web_search_tool_result' ||
-    block.type === 'code_execution_tool_result' ||
-    block.type === 'tool_use' ||
-    block.type === 'tool_result'
-  );
+function extractCodeBlocks(text = '') {
+  const matches = text.match(/```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g);
+  if (!matches?.length) return '';
+  return matches
+    .map((match) => match.replace(/```(?:[a-zA-Z0-9_-]+)?\n?|```/g, '').trim())
+    .filter(Boolean)
+    .join('\n\n')
+    .slice(0, 1200);
+}
+
+function extractPlanText(text = '') {
+  const planSection = text.match(/(?:^|\n)(?:plan|steps?)\s*:\s*([\s\S]{0,1500})/i);
+  if (planSection?.[1]) return planSection[1].trim().split('\n\n')[0].slice(0, 1200);
+  return '';
 }
 
 function parseJsonObject(text) {
@@ -34,14 +42,58 @@ function parseJsonObject(text) {
   }
 }
 
+function sanitizeRawExcerpt(value = '') {
+  const redacted = String(value)
+    .replace(/(sk-[a-zA-Z0-9-_]+)/g, '[REDACTED_KEY]')
+    .replace(/("?(?:api[_-]?key|authorization|token)"?\s*[:=]\s*")([^"]+)(")/gi, '$1[REDACTED]$3')
+    .replace(/(Bearer\s+)[a-zA-Z0-9._-]+/gi, '$1[REDACTED]')
+    .trim();
+  return redacted.slice(0, MAX_RAW_EXCERPT);
+}
+
+function collectRawContentTypes(content = []) {
+  return Array.from(new Set(content.map((block) => block?.type).filter(Boolean)));
+}
+
+function hasToolUse(content = []) {
+  return content.some((block) => block?.type === 'tool_use' || block?.type === 'server_tool_use');
+}
+
+function hasToolResult(content = []) {
+  return content.some((block) =>
+    block?.type === 'tool_result' ||
+    block?.type === 'code_execution_tool_result' ||
+    block?.type === 'web_search_tool_result'
+  );
+}
+
+function countByTypes(content = [], types = []) {
+  return content.filter((block) => types.includes(block?.type)).length;
+}
+
+function normalizePayload(candidate = {}) {
+  return {
+    plan: typeof candidate.plan === 'string' ? candidate.plan : '',
+    summary: typeof candidate.summary === 'string' ? candidate.summary : '',
+    cleaned_csv: typeof candidate.cleaned_csv === 'string' ? candidate.cleaned_csv : '',
+    generated_code_excerpt:
+      typeof candidate.generated_code_excerpt === 'string' ? candidate.generated_code_excerpt : '',
+    warnings: Array.isArray(candidate.warnings) ? candidate.warnings.map(String) : [],
+    validation_notes: Array.isArray(candidate.validation_notes)
+      ? candidate.validation_notes.map(String)
+      : []
+  };
+}
+
 function buildSystemPrompt() {
   return [
     'You are a bounded dynamic CSV execution agent.',
-    'Your job is to inspect CSV text, create a plan, write transformation code, execute that code with the code execution tool, inspect output, and return structured JSON.',
-    'You MUST use the code execution tool before returning your final answer.',
+    'Inspect CSV text, create a plan, write transformation code, execute it with the code execution tool, inspect output, then return final JSON.',
+    'You MUST use the code execution tool before finalizing when CSV is provided.',
     'Do not fabricate successful execution. If execution fails, explain and retry with revised code.',
     'Preserve uncertain/invalid values and provide warnings instead of silently forcing a fix.',
-    'Output format must be strict JSON with keys:',
+    'After any tool-use content, always end with one strict JSON object and no extra text.',
+    'Required JSON keys:',
     '{',
     '  "plan": "string",',
     '  "summary": "string",',
@@ -77,10 +129,46 @@ function buildUserPrompt({ task, csvText, iteration, maxIterations, priorFailure
     '- Return cleaned CSV with headers and data rows.',
     '- If task asks for deduplication/date normalization/missing value handling, satisfy that behavior.',
     '- Keep CSV valid and parseable.',
-    '- Return strict JSON only.'
+    '- Final answer must be a strict JSON object with required keys after any tool output.'
   );
 
   return sections.join('\n');
+}
+
+async function tryFormattingRepair({ anthropic, model, textToRepair, debug }) {
+  if (!textToRepair) return null;
+
+  try {
+    const repair = await anthropic.messages.create({
+      model: model || DEFAULT_MODEL,
+      max_tokens: 1200,
+      temperature: 0,
+      system:
+        'Convert the provided execution output into one strict JSON object with keys: plan, summary, cleaned_csv, generated_code_excerpt, warnings, validation_notes. Return JSON only.',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `Convert this content to the required JSON shape. If a field is missing, use empty string or empty array.\n\n${textToRepair}`
+            }
+          ]
+        }
+      ]
+    });
+
+    const repairText = extractTextBlocks(Array.isArray(repair.content) ? repair.content : []);
+    debug.raw_stop_reason = typeof repair?.stop_reason === 'string' ? repair.stop_reason : debug.raw_stop_reason;
+    if (repairText) {
+      debug.raw_response_excerpt = sanitizeRawExcerpt(repairText);
+      return normalizePayload(parseJsonObject(repairText));
+    }
+    return null;
+  } catch (error) {
+    debug.parser_error = `Formatting-repair retry failed: ${error?.message || 'Unknown error'}`;
+    return null;
+  }
 }
 
 function buildAdvisoryResponse(task = '') {
@@ -142,19 +230,26 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
       name: 'code_execution'
     }
   ];
+
   const debug = {
     anthropic_tools_sent: anthropicTools.map((tool) => tool.type || tool.name).filter(Boolean),
     tool_use_detected: false,
     tool_result_detected: false,
     tool_use_count: 0,
     tool_result_count: 0,
-    raw_stop_reason: null
+    raw_stop_reason: null,
+    raw_content_types: [],
+    raw_response_excerpt: '',
+    parser_stage_reached: '',
+    parser_error: null
   };
 
   let finalPayload = null;
+  let finalText = '';
   let validation = null;
   let iterationsUsed = 0;
   let codeToolUsed = false;
+  let fallbackArtifacts = { plan: '', generated_code: '' };
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     iterationsUsed = iteration;
@@ -183,23 +278,32 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
           }
         ]
       });
+      debug.parser_stage_reached = 'received_response';
     } catch (error) {
       const details = error?.message || 'Unknown Anthropic error';
       throw new Error(`Dynamic Claude execution failed: ${details}`);
     }
 
     const content = Array.isArray(message.content) ? message.content : [];
-    const toolUseCount = content.filter((block) => block?.type === 'tool_use').length;
-    const toolResultCount = content.filter((block) => block?.type === 'tool_result').length;
+    debug.raw_content_types = Array.from(new Set([...debug.raw_content_types, ...collectRawContentTypes(content)]));
+    const toolUseCount = countByTypes(content, ['tool_use', 'server_tool_use']);
+    const toolResultCount = countByTypes(content, [
+      'tool_result',
+      'code_execution_tool_result',
+      'web_search_tool_result'
+    ]);
     debug.tool_use_count += toolUseCount;
     debug.tool_result_count += toolResultCount;
-    debug.tool_use_detected = debug.tool_use_count > 0;
-    debug.tool_result_detected = debug.tool_result_count > 0;
+    debug.tool_use_detected = debug.tool_use_detected || hasToolUse(content);
+    debug.tool_result_detected = debug.tool_result_detected || hasToolResult(content);
+    if (debug.tool_use_detected) debug.parser_stage_reached = 'detected_tool_use';
+    if (debug.tool_result_detected) debug.parser_stage_reached = 'detected_tool_result';
+
     if (typeof message?.stop_reason === 'string') {
       debug.raw_stop_reason = message.stop_reason;
     }
 
-    if (hasCodeToolSignals(content)) {
+    if (debug.tool_use_detected || debug.tool_result_detected) {
       codeToolUsed = true;
     }
 
@@ -209,19 +313,29 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
       continue;
     }
 
-    let candidate;
+    finalText = responseText;
+    debug.raw_response_excerpt = sanitizeRawExcerpt(responseText);
+    debug.parser_stage_reached = 'parsed_final_text';
+
+    fallbackArtifacts = {
+      plan: extractPlanText(responseText),
+      generated_code: extractCodeBlocks(responseText)
+    };
+
     try {
-      candidate = parseJsonObject(responseText);
+      const candidate = normalizePayload(parseJsonObject(responseText));
+      debug.parser_stage_reached = 'parsed_structured_json';
+      finalPayload = candidate;
     } catch (error) {
-      logs.push(`Claude returned non-JSON response on iteration ${iteration}; retrying...`);
-      allWarnings.push(error.message);
+      debug.parser_error = error.message;
+      logs.push(`Claude returned unstructured text on iteration ${iteration}; attempting fallback handling...`);
+      allWarnings.push('Claude response was not strict JSON; building partial dynamic response.');
       continue;
     }
 
-    if (!candidate.cleaned_csv || typeof candidate.cleaned_csv !== 'string') {
+    if (!finalPayload.cleaned_csv) {
       logs.push(`Candidate output missing cleaned_csv on iteration ${iteration}; retrying...`);
       allWarnings.push('Claude response missing cleaned_csv field.');
-      finalPayload = candidate;
       continue;
     }
 
@@ -229,11 +343,10 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     validation = validateDynamicCsvResult({
       task: taskText,
       inputCsv: csvText,
-      outputCsv: candidate.cleaned_csv
+      outputCsv: finalPayload.cleaned_csv
     });
 
-    finalPayload = candidate;
-    allWarnings.push(...(candidate.warnings || []));
+    allWarnings.push(...finalPayload.warnings);
     allWarnings.push(...validation.warnings);
 
     if (validation.passed) {
@@ -244,8 +357,66 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     logs.push(`Validation failed: ${validation.failures.join(' ')} Retrying...`);
   }
 
+  if (!finalPayload && finalText) {
+    logs.push('Attempting one formatting-repair retry for invalid structured output...');
+    const repairedPayload = await tryFormattingRepair({
+      anthropic,
+      model,
+      textToRepair: finalText,
+      debug
+    });
+
+    if (repairedPayload) {
+      finalPayload = repairedPayload;
+      debug.parser_stage_reached = 'parsed_structured_json';
+      allWarnings.push('Structured payload recovered via formatting-repair retry.');
+    }
+  }
+
+  let executionMode = 'dynamic_agent_execution';
+
   if (!finalPayload) {
-    throw new Error('Claude failed to produce a usable dynamic execution payload.');
+    debug.parser_stage_reached = 'built_fallback_response';
+    const partialWarnings = [
+      ...allWarnings,
+      'Dynamic response was partial/unstructured. Returning best-effort result.'
+    ];
+
+    const partialResult = finalText || 'No usable final text returned by Claude.';
+    const inputRows = getInputRowCount(csvText);
+
+    if (!partialResult && !fallbackArtifacts.plan && !fallbackArtifacts.generated_code) {
+      throw new Error('Claude failed to produce any usable response content.');
+    }
+
+    executionMode = 'dynamic_agent_execution_partial';
+
+    console.log('[execute-dynamic] parser_stage_reached:', debug.parser_stage_reached);
+    console.log('[execute-dynamic] raw_content_types:', debug.raw_content_types);
+    console.log('[execute-dynamic] parser_error:', debug.parser_error);
+    console.log('[execute-dynamic] tool_use_detected:', debug.tool_use_detected);
+    console.log('[execute-dynamic] tool_result_detected:', debug.tool_result_detected);
+
+    return {
+      result: partialResult,
+      logs,
+      metadata: {
+        execution_mode: executionMode,
+        rows_input: inputRows,
+        rows_output: 0,
+        duplicates_removed: null,
+        dates_normalized: null,
+        validation_passed: false,
+        iterations_used: iterationsUsed,
+        warnings: Array.from(new Set(partialWarnings.filter(Boolean))),
+        dynamic_code_used: codeToolUsed
+      },
+      artifacts: {
+        generated_code: fallbackArtifacts.generated_code || undefined,
+        plan: fallbackArtifacts.plan || undefined
+      },
+      debug
+    };
   }
 
   if (!validation) {
@@ -254,27 +425,32 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
       inputCsv: csvText,
       outputCsv: finalPayload.cleaned_csv || ''
     });
+    allWarnings.push(...validation.warnings);
+    allWarnings.push(...finalPayload.warnings);
+    allWarnings.push(...finalPayload.validation_notes);
   }
 
+  const cleanedCsvText = (finalPayload.cleaned_csv || '').trim();
   const summary = finalPayload.summary ? `Summary:\n${finalPayload.summary}` : 'Summary:\nNo summary returned.';
-  const result = `${(finalPayload.cleaned_csv || '').trim()}\n\n${summary}`.trim();
+  const result = `${cleanedCsvText}\n\n${summary}`.trim();
 
   if (!codeToolUsed) {
     allWarnings.push('No explicit code-execution tool output detected; verify Anthropic tool availability.');
   }
 
-  console.log('[execute-dynamic] anthropic_tools_sent:', debug.anthropic_tools_sent);
+  const inputRows = validation.rows_input ?? getInputRowCount(csvText);
+
+  console.log('[execute-dynamic] parser_stage_reached:', debug.parser_stage_reached);
+  console.log('[execute-dynamic] raw_content_types:', debug.raw_content_types);
+  console.log('[execute-dynamic] parser_error:', debug.parser_error);
   console.log('[execute-dynamic] tool_use_detected:', debug.tool_use_detected);
   console.log('[execute-dynamic] tool_result_detected:', debug.tool_result_detected);
-  console.log('[execute-dynamic] raw_stop_reason:', debug.raw_stop_reason);
-
-  const inputRows = validation.rows_input ?? getInputRowCount(csvText);
 
   return {
     result,
     logs,
     metadata: {
-      execution_mode: 'dynamic_agent_execution',
+      execution_mode: executionMode,
       rows_input: inputRows,
       rows_output: validation.rows_output ?? 0,
       duplicates_removed: validation.duplicates_removed,
@@ -287,8 +463,8 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     artifacts: {
       generated_code: finalPayload.generated_code_excerpt
         ? String(finalPayload.generated_code_excerpt).slice(0, 1200)
-        : undefined,
-      plan: finalPayload.plan
+        : fallbackArtifacts.generated_code || undefined,
+      plan: finalPayload.plan || fallbackArtifacts.plan || undefined
     },
     debug
   };
