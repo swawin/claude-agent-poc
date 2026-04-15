@@ -84,6 +84,14 @@ function buildUserPrompt({ task, csvText, iteration, maxIterations, priorFailure
 }
 
 function buildAdvisoryResponse(task = '') {
+  const debug = {
+    anthropic_tools_sent: [],
+    tool_use_detected: false,
+    tool_result_detected: false,
+    tool_use_count: 0,
+    tool_result_count: 0
+  };
+
   return {
     result: [
       'Dynamic execution mode is enabled, but this demo requires an uploaded CSV file.',
@@ -109,7 +117,8 @@ function buildAdvisoryResponse(task = '') {
     },
     artifacts: {
       plan: 'Upload CSV -> plan -> generate code -> execute in Anthropic sandbox -> validate -> retry if needed.'
-    }
+    },
+    debug
   };
 }
 
@@ -141,11 +150,24 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
   let validation = null;
   let iterationsUsed = 0;
   let codeToolUsed = false;
+  let debugToolsSent = [];
+  let toolUseDetected = false;
+  let toolResultDetected = false;
+  let toolUseCount = 0;
+  let toolResultCount = 0;
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     iterationsUsed = iteration;
     logs.push(`Generating transformation code (iteration ${iteration}/${MAX_ITERATIONS})...`);
     logs.push('Executing code in Anthropic sandbox...');
+
+    const tools = [
+      {
+        type: 'code_execution_20250522',
+        name: 'code_execution'
+      }
+    ];
+    debugToolsSent = tools.map((tool) => tool?.type || tool?.name).filter(Boolean);
 
     let message;
     try {
@@ -154,12 +176,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
         max_tokens: 1800,
         temperature: 0,
         system: buildSystemPrompt(),
-        tools: [
-          {
-            type: 'code_execution_20250522',
-            name: 'code_execution'
-          }
-        ],
+        tools,
         messages: [
           {
             role: 'user',
@@ -180,6 +197,23 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     }
 
     const content = Array.isArray(message.content) ? message.content : [];
+    const iterationToolUseCount = content.filter((block) => block?.type === 'tool_use').length;
+    const iterationToolResultCount = content.filter((block) => block?.type === 'tool_result').length;
+    const stopReasonToolUse = message?.stop_reason === 'tool_use';
+
+    if (iterationToolUseCount > 0 || stopReasonToolUse) {
+      toolUseDetected = true;
+    }
+    if (iterationToolResultCount > 0) {
+      toolResultDetected = true;
+    }
+
+    toolUseCount += iterationToolUseCount;
+    if (stopReasonToolUse && iterationToolUseCount === 0) {
+      toolUseCount += 1;
+    }
+    toolResultCount += iterationToolResultCount;
+
     if (hasCodeToolSignals(content)) {
       codeToolUsed = true;
     }
@@ -245,6 +279,19 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
   }
 
   const inputRows = validation.rows_input ?? getInputRowCount(csvText);
+  const debug = {
+    anthropic_tools_sent: debugToolsSent,
+    tool_use_detected: toolUseDetected,
+    tool_result_detected: toolResultDetected,
+    tool_use_count: toolUseCount,
+    tool_result_count: toolResultCount
+  };
+
+  console.log('DEBUG - Anthropic tools sent:', debugToolsSent);
+  console.log('DEBUG - tool_use_detected:', toolUseDetected);
+  console.log('DEBUG - tool_result_detected:', toolResultDetected);
+  console.log('DEBUG - tool_use_count:', toolUseCount);
+  console.log('DEBUG - tool_result_count:', toolResultCount);
 
   return {
     result,
@@ -265,6 +312,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
         ? String(finalPayload.generated_code_excerpt).slice(0, 1200)
         : undefined,
       plan: finalPayload.plan
-    }
+    },
+    debug
   };
 }
