@@ -4,6 +4,7 @@ import { validateDynamicCsvResult, getInputRowCount } from './dynamicValidation.
 const MAX_ITERATIONS = 2;
 const DEFAULT_MODEL = 'claude-sonnet-4-5';
 const MAX_RAW_EXCERPT = 700;
+const CSV_DEBUG_PREVIEW_LENGTH = 200;
 
 
 function extractTextBlocks(content) {
@@ -96,7 +97,10 @@ function buildSystemPrompt() {
     'Inspect inline CSV text, create a plan, write transformation code, execute it with the code execution tool, inspect output, then return final JSON.',
     'You MUST use the code execution tool before finalizing when CSV is provided.',
     'The CSV is provided inline in the user message and is the only source of truth.',
-    'Load the CSV from the provided string (e.g., io.StringIO + pandas.read_csv).',
+    'You MUST use the provided CSV content above and MUST NOT claim it is missing.',
+    'Do NOT assume external files exist in the runtime.',
+    'Do NOT use pd.read_csv("data.csv") or any filename-based CSV loading.',
+    'Load the CSV from the provided csv_text variable with from io import StringIO and pandas.read_csv(StringIO(csv_text)).',
     'Do NOT read files like data.csv or any other placeholder/local filename.',
     'Do not describe what you would do. Do not return generic templates.',
     'Do not fabricate successful execution. If execution fails, explain and retry with revised code.',
@@ -125,13 +129,24 @@ function buildUserPrompt({
   priorOutput,
   correctionMessage
 }) {
+  const escapedCsvForPython = JSON.stringify(csvText);
   const sections = [
     `Task: ${task || 'Clean and normalize this CSV.'}`,
     `Iteration: ${iteration} of ${maxIterations}`,
-    'CSV input (raw text, inline, source of truth):',
-    '<csv_inline>',
+    'Here is the CSV content:',
+    '<CSV>',
     csvText,
-    '</csv_inline>'
+    '</CSV>',
+    '',
+    'Use this exact variable in your execution code:',
+    `csv_text = ${escapedCsvForPython}`,
+    '',
+    'Important execution rules:',
+    '- You MUST use the provided CSV content above.',
+    '- Do NOT assume external files.',
+    '- Do NOT use pd.read_csv("data.csv") or any filename.',
+    '- Instead use: from io import StringIO ; df = pd.read_csv(StringIO(csv_text))',
+    '- csv_text must come from the provided content.'
   ];
 
   if (priorOutput) {
@@ -230,7 +245,14 @@ function buildAdvisoryResponse(task = '') {
 
 function detectPlaceholderFileAccess(text = '') {
   if (!text) return false;
-  return /pd\.read_csv\(\s*["'](?:data|input|output|cleaned|sample|test|file)\.csv["']\s*\)/i.test(text);
+  return /(?:pd|pandas)\.read_csv\(\s*["'][^"']+\.csv["']\s*\)/i.test(text);
+}
+
+function detectMissingCsvClaim(text = '') {
+  if (!text) return false;
+  return /(no csv data was provided|no csv (?:was )?provided|csv (?:content|data) (?:is )?missing|missing csv data)/i.test(
+    text
+  );
 }
 
 function isGenericSummary(summary = '', rowsInput = 0, rowsOutput = 0) {
@@ -242,15 +264,13 @@ function isGenericSummary(summary = '', rowsInput = 0, rowsOutput = 0) {
   return !(mentionsInput || mentionsOutput);
 }
 
-export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model }) {
+export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey, model }) {
   const taskText = (task || '').trim();
-  if (!fileBuffer) {
-    return buildAdvisoryResponse(taskText);
-  }
+  const resolvedCsvText =
+    typeof csvText === 'string' ? csvText : fileBuffer ? fileBuffer.toString('utf-8') : '';
 
-  const csvText = fileBuffer.toString('utf-8');
-  if (!csvText.trim()) {
-    throw new Error('Uploaded CSV file is empty.');
+  if (!resolvedCsvText.trim()) {
+    return buildAdvisoryResponse(taskText);
   }
 
   if (!apiKey) {
@@ -284,7 +304,10 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     parser_stage_reached: '',
     parser_error: null,
     csv_inline_provided: true,
+    csv_chars_length: resolvedCsvText.length,
+    csv_preview: resolvedCsvText.slice(0, CSV_DEBUG_PREVIEW_LENGTH),
     placeholder_file_access_detected: false,
+    missing_csv_claim_detected: false,
     cleaned_csv_empty: false
   };
 
@@ -314,7 +337,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
             role: 'user',
             content: buildUserPrompt({
               task: taskText,
-              csvText,
+              csvText: resolvedCsvText,
               iteration,
               maxIterations: MAX_ITERATIONS,
               priorFailures: validation?.failures,
@@ -388,6 +411,33 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
       continue;
     }
 
+    const missingCsvClaimDetected = detectMissingCsvClaim(
+      [
+        responseText,
+        finalPayload.summary,
+        ...(finalPayload.validation_notes || []),
+        ...(finalPayload.warnings || [])
+      ]
+        .filter(Boolean)
+        .join('\n')
+    );
+    debug.missing_csv_claim_detected = debug.missing_csv_claim_detected || missingCsvClaimDetected;
+    if (missingCsvClaimDetected) {
+      validation = {
+        passed: false,
+        warnings: [],
+        failures: ['Claude claimed CSV was not provided even though CSV content was injected.'],
+        rows_input: getInputRowCount(resolvedCsvText),
+        rows_output: 0,
+        duplicates_removed: null,
+        dates_normalized: null
+      };
+      logs.push('Validation failed: Claude claimed CSV was missing. Retrying with stronger grounding...');
+      correctionMessage =
+        'You were already given CSV content. You must use it. Do not claim CSV is missing. Use csv_text and StringIO(csv_text) only.';
+      continue;
+    }
+
     const placeholderDetected = detectPlaceholderFileAccess(
       [finalPayload.generated_code_excerpt, fallbackArtifacts.generated_code, responseText].filter(Boolean).join('\n')
     );
@@ -397,21 +447,21 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
         passed: false,
         warnings: [],
         failures: ['Generated code uses placeholder file access (e.g., data.csv).'],
-        rows_input: getInputRowCount(csvText),
+        rows_input: getInputRowCount(resolvedCsvText),
         rows_output: 0,
         duplicates_removed: null,
         dates_normalized: null
       };
       logs.push('Validation failed: placeholder file access detected. Retrying with correction instructions...');
       correctionMessage =
-        'You must use the inline CSV content already provided. Do not use external filenames. Return actual cleaned CSV text and structured JSON only.';
+        'You were already given CSV content. You must use it. Do not use external filenames. Use csv_text and StringIO(csv_text) only.';
       continue;
     }
 
     logs.push('Inspecting generated output...');
     validation = validateDynamicCsvResult({
       task: taskText,
-      inputCsv: csvText,
+      inputCsv: resolvedCsvText,
       outputCsv: finalPayload.cleaned_csv
     });
 
@@ -420,7 +470,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
 
     const genericSummary = isGenericSummary(
       finalPayload.summary,
-      validation.rows_input ?? getInputRowCount(csvText),
+      validation.rows_input ?? getInputRowCount(resolvedCsvText),
       validation.rows_output ?? 0
     );
     if (genericSummary) {
@@ -435,7 +485,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
 
     logs.push(`Validation failed: ${validation.failures.join(' ')} Retrying...`);
     correctionMessage =
-      'You must use the inline CSV content already provided. Do not use external filenames. Return actual cleaned CSV text and structured JSON only.';
+      'You were already given CSV content. You must use it. Do not use external filenames. Use csv_text and StringIO(csv_text) only.';
   }
 
   if (!finalPayload && finalText) {
@@ -464,7 +514,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     ];
 
     const partialResult = finalText || 'No usable final text returned by Claude.';
-    const inputRows = getInputRowCount(csvText);
+    const inputRows = getInputRowCount(resolvedCsvText);
 
     if (!partialResult && !fallbackArtifacts.plan && !fallbackArtifacts.generated_code) {
       throw new Error('Claude failed to produce any usable response content.');
@@ -503,7 +553,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
   if (!validation) {
     validation = validateDynamicCsvResult({
       task: taskText,
-      inputCsv: csvText,
+      inputCsv: resolvedCsvText,
       outputCsv: finalPayload.cleaned_csv || ''
     });
     allWarnings.push(...validation.warnings);
@@ -520,7 +570,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     allWarnings.push('No explicit code-execution tool output detected; verify Anthropic tool availability.');
   }
 
-  const inputRows = validation.rows_input ?? getInputRowCount(csvText);
+  const inputRows = validation.rows_input ?? getInputRowCount(resolvedCsvText);
 
   console.log('[execute-dynamic] parser_stage_reached:', debug.parser_stage_reached);
   console.log('[execute-dynamic] raw_content_types:', debug.raw_content_types);

@@ -129,9 +129,10 @@ app.post('/execute', upload.single('file'), async (req, res) => {
 app.post('/execute-dynamic', upload.single('file'), async (req, res) => {
   try {
     const task = (req.body.task || '').trim();
+    const csvText = req.file ? req.file.buffer.toString('utf-8') : '';
     const response = await executeDynamicCsvTask({
       task,
-      fileBuffer: req.file?.buffer,
+      csvText,
       apiKey: process.env.ANTHROPIC_API_KEY,
       model: process.env.CLAUDE_MODEL
     });
