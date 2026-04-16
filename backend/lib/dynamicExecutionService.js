@@ -159,10 +159,11 @@ function inspectAnthropicContentBlocks(content = []) {
 function extractToolUses(content = []) {
   return content.filter(
     (block) =>
-      (block?.type === 'tool_use' || block?.type === 'server_tool_use') &&
+      (block?.type === 'tool_use' ||
+        block?.type === 'server_tool_use' ||
+        block?.type === 'code_execution') &&
       typeof block?.id === 'string' &&
-      block.id.trim().length > 0 &&
-      block?.name
+      block.id.trim().length > 0
   );
 }
 
@@ -181,7 +182,25 @@ function describeMessageContentTypes(content) {
 }
 
 function describeConversationSequence(messages = []) {
-  return messages.map((message) => `${message.role}(${describeMessageContentTypes(message.content)})`);
+  return messages.map((message) => {
+    const contentTypes = describeMessageContentTypes(message.content);
+    if (Array.isArray(message.content) && message.content.some((block) => block?.type === 'code_execution_tool_result')) {
+      return `tool(${contentTypes})`;
+    }
+    return `${message.role}(${contentTypes})`;
+  });
+}
+
+function collectToolResultIds(content = []) {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter(
+      (block) =>
+        block?.type === 'code_execution_tool_result' &&
+        typeof block?.tool_use_id === 'string' &&
+        block.tool_use_id.trim().length > 0
+    )
+    .map((block) => block.tool_use_id);
 }
 
 function buildSandboxWrapper(code = '') {
@@ -584,6 +603,16 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
           `Anthropic tool handshake violation: missing code_execution_tool_result for tool_use_id(s): ${missingToolResultIds.join(', ')}`
         );
       }
+      if (pendingToolUseIds.size > 0) {
+        const lastMessage = apiConversation[apiConversation.length - 1];
+        const lastMessageResultIds = collectToolResultIds(lastMessage?.content);
+        const unsentPendingIds = Array.from(pendingToolUseIds).filter((id) => !lastMessageResultIds.includes(id));
+        if (unsentPendingIds.length > 0) {
+          throw new Error(
+            `Anthropic tool handshake violation: tool_use_id(s) missing in outgoing tool_result blocks: ${unsentPendingIds.join(', ')}`
+          );
+        }
+      }
 
       const requestSequence = describeConversationSequence(apiConversation);
       debug.anthropic_request_message_count = apiConversation.length;
@@ -636,10 +665,12 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       }
 
       if (toolUses.length > 0) {
+        const toolUseIdsThisTurn = [];
         const toolResultBlocks = [];
         for (const toolUse of toolUses) {
-          const toolName = String(toolUse?.name || '').trim();
+          const toolName = String(toolUse?.name || 'code_execution').trim();
           pendingToolUseIds.add(toolUse.id);
+          toolUseIdsThisTurn.push(toolUse.id);
           debug.last_tool_use_id = toolUse.id;
           const generatedCode = extractGeneratedCode(toolUse?.input);
           const toolOutput = await runCodeExecutionTool({ code: generatedCode, toolName });
@@ -661,11 +692,18 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
           debug.parser_stage_reached = 'detected_tool_result';
         }
 
+        const unsatisfiedToolUseIds = toolUseIdsThisTurn.filter((id) => !sentToolResultIds.has(id));
+        if (unsatisfiedToolUseIds.length > 0) {
+          throw new Error(
+            `Anthropic tool handshake violation: tool_result not created for tool_use_id(s): ${unsatisfiedToolUseIds.join(', ')}`
+          );
+        }
+
         apiConversation.push({
           role: 'user',
           content: toolResultBlocks
         });
-        for (const toolUseId of sentToolResultIds) {
+        for (const toolUseId of toolUseIdsThisTurn) {
           pendingToolUseIds.delete(toolUseId);
         }
         continue;
