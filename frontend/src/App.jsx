@@ -154,6 +154,27 @@ export default function App() {
         <pre>{result || 'No output yet.'}</pre>
       </section>
 
+      {artifacts?.cleaned_csv && (
+        <section>
+          <h2>Cleaned CSV</h2>
+          <pre>{artifacts.cleaned_csv}</pre>
+        </section>
+      )}
+
+      {artifacts?.anomalies?.length > 0 && (
+        <section>
+          <h2>Anomalies</h2>
+          <pre>{JSON.stringify(artifacts.anomalies, null, 2)}</pre>
+        </section>
+      )}
+
+      {artifacts?.per_user_summary && (
+        <section>
+          <h2>Per-user Summary</h2>
+          <pre>{JSON.stringify(artifacts.per_user_summary, null, 2)}</pre>
+        </section>
+      )}
+
       {artifacts?.plan && (
         <section>
           <h2>Agent Plan</h2>
