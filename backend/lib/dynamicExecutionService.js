@@ -157,7 +157,13 @@ function inspectAnthropicContentBlocks(content = []) {
 }
 
 function extractToolUses(content = []) {
-  return content.filter((block) => block?.type === 'tool_use' && block?.name);
+  return content.filter(
+    (block) =>
+      (block?.type === 'tool_use' || block?.type === 'server_tool_use') &&
+      typeof block?.id === 'string' &&
+      block.id.trim().length > 0 &&
+      block?.name
+  );
 }
 
 function extractGeneratedCode(toolInput) {
@@ -166,6 +172,16 @@ function extractGeneratedCode(toolInput) {
   if (typeof toolInput.source === 'string') return toolInput.source;
   if (typeof toolInput.script === 'string') return toolInput.script;
   return '';
+}
+
+function describeMessageContentTypes(content) {
+  if (typeof content === 'string') return 'text';
+  if (!Array.isArray(content)) return 'unknown';
+  return content.map((block) => block?.type || 'unknown').join(' + ');
+}
+
+function describeConversationSequence(messages = []) {
+  return messages.map((message) => `${message.role}(${describeMessageContentTypes(message.content)})`);
 }
 
 function buildSandboxWrapper(code = '') {
@@ -505,7 +521,11 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     loop_iterations: 0,
     tool_chain_valid: false,
     outcome: 'execution_not_completed',
-    content_blocks_seen: []
+    content_blocks_seen: [],
+    last_tool_use_id: '',
+    tool_result_appended: false,
+    tool_result_ids_sent: [],
+    anthropic_request_message_count: 0
   };
 
   let finalPayload = null;
@@ -548,6 +568,8 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     let parsedFirstPass = false;
     let responseText = '';
     let hitToolLoopCap = false;
+    const pendingToolUseIds = new Set();
+    const sentToolResultIds = new Set();
 
     for (let loopIteration = 1; loopIteration <= MAX_TOOL_LOOP_ITERATIONS; loopIteration += 1) {
       if (debug.loop_iterations >= MAX_TOOL_LOOP_ITERATIONS) {
@@ -556,6 +578,16 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       debug.loop_iterations += 1;
 
       let message;
+      const missingToolResultIds = Array.from(pendingToolUseIds).filter((id) => !sentToolResultIds.has(id));
+      if (missingToolResultIds.length > 0) {
+        throw new Error(
+          `Anthropic tool handshake violation: missing code_execution_tool_result for tool_use_id(s): ${missingToolResultIds.join(', ')}`
+        );
+      }
+
+      const requestSequence = describeConversationSequence(apiConversation);
+      debug.anthropic_request_message_count = apiConversation.length;
+      console.log('[execute-dynamic] anthropic_request_sequence:', requestSequence.join(' -> '));
       try {
         message = await anthropic.messages.create({
           model: model || DEFAULT_MODEL,
@@ -607,6 +639,8 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
         const toolResultBlocks = [];
         for (const toolUse of toolUses) {
           const toolName = String(toolUse?.name || '').trim();
+          pendingToolUseIds.add(toolUse.id);
+          debug.last_tool_use_id = toolUse.id;
           const generatedCode = extractGeneratedCode(toolUse?.input);
           const toolOutput = await runCodeExecutionTool({ code: generatedCode, toolName });
 
@@ -617,10 +651,13 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
           });
 
           toolResultBlocks.push({
-            type: 'tool_result',
+            type: 'code_execution_tool_result',
             tool_use_id: toolUse.id,
             content: toolOutput
           });
+          sentToolResultIds.add(toolUse.id);
+          debug.tool_result_ids_sent.push(toolUse.id);
+          debug.tool_result_appended = true;
           debug.parser_stage_reached = 'detected_tool_result';
         }
 
@@ -628,16 +665,9 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
           role: 'user',
           content: toolResultBlocks
         });
-        continue;
-      }
-
-      if (contentInspection.server_tool_use_detected) {
-        debug.finalization_call_made = true;
-        logs.push('Detected server-side tool execution; requesting final JSON payload...');
-        apiConversation.push({
-          role: 'user',
-          content: [{ type: 'text', text: buildFinalizationInstruction() }]
-        });
+        for (const toolUseId of sentToolResultIds) {
+          pendingToolUseIds.delete(toolUseId);
+        }
         continue;
       }
 
