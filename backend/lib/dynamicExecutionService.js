@@ -117,24 +117,43 @@ function sanitizeRawExcerpt(value = '') {
   return redacted.slice(0, MAX_RAW_EXCERPT);
 }
 
-function collectRawContentTypes(content = []) {
-  return Array.from(new Set(content.map((block) => block?.type).filter(Boolean)));
-}
+function inspectAnthropicContentBlocks(content = []) {
+  const rawContentTypes = new Set();
+  const contentBlocks = [];
+  let toolUseCount = 0;
+  let toolResultCount = 0;
+  let serverToolUseCount = 0;
 
-function hasToolUse(content = []) {
-  return content.some((block) => block?.type === 'tool_use' || block?.type === 'server_tool_use');
-}
+  for (const [index, block] of content.entries()) {
+    const type = block?.type || 'unknown';
+    const triggeredToolUse = type === 'tool_use' || type === 'server_tool_use';
+    const triggeredToolResult =
+      type === 'tool_result' ||
+      type === 'code_execution_tool_result' ||
+      type === 'web_search_tool_result';
 
-function hasToolResult(content = []) {
-  return content.some((block) =>
-    block?.type === 'tool_result' ||
-    block?.type === 'code_execution_tool_result' ||
-    block?.type === 'web_search_tool_result'
-  );
-}
+    if (type) rawContentTypes.add(type);
+    if (triggeredToolUse) toolUseCount += 1;
+    if (type === 'server_tool_use') serverToolUseCount += 1;
+    if (triggeredToolResult) toolResultCount += 1;
 
-function countByTypes(content = [], types = []) {
-  return content.filter((block) => types.includes(block?.type)).length;
+    contentBlocks.push({
+      index,
+      type,
+      triggered_tool_use: triggeredToolUse,
+      triggered_tool_result: triggeredToolResult
+    });
+  }
+
+  return {
+    raw_content_types: Array.from(rawContentTypes),
+    tool_use_detected: toolUseCount > 0,
+    server_tool_use_detected: serverToolUseCount > 0,
+    tool_result_detected: toolResultCount > 0,
+    tool_use_count: toolUseCount,
+    tool_result_count: toolResultCount,
+    content_blocks: contentBlocks
+  };
 }
 
 function extractToolUses(content = []) {
@@ -485,7 +504,8 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     cleaned_csv_row_count: 0,
     loop_iterations: 0,
     tool_chain_valid: false,
-    outcome: 'execution_not_completed'
+    outcome: 'execution_not_completed',
+    content_blocks_seen: []
   };
 
   let finalPayload = null;
@@ -552,7 +572,24 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       }
 
       const content = Array.isArray(message.content) ? message.content : [];
-      debug.raw_content_types = Array.from(new Set([...debug.raw_content_types, ...collectRawContentTypes(content)]));
+      const contentInspection = inspectAnthropicContentBlocks(content);
+      debug.raw_content_types = Array.from(
+        new Set([...debug.raw_content_types, ...contentInspection.raw_content_types])
+      );
+      debug.tool_use_detected = debug.tool_use_detected || contentInspection.tool_use_detected;
+      debug.server_tool_use_detected =
+        debug.server_tool_use_detected || contentInspection.server_tool_use_detected;
+      debug.tool_result_detected = debug.tool_result_detected || contentInspection.tool_result_detected;
+      debug.tool_use_count += contentInspection.tool_use_count;
+      debug.tool_result_count += contentInspection.tool_result_count;
+      debug.content_blocks_seen.push(
+        ...contentInspection.content_blocks.map(({ index, type }) => ({ index, type }))
+      );
+      for (const block of contentInspection.content_blocks) {
+        console.log(
+          `[execute-dynamic] content_block index=${block.index} type=${block.type} tool_use=${block.triggered_tool_use} tool_result=${block.triggered_tool_result}`
+        );
+      }
       if (typeof message?.stop_reason === 'string') {
         debug.raw_stop_reason = message.stop_reason;
       }
@@ -561,14 +598,12 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       toolConversation.push({ role: 'assistant', content });
 
       const toolUses = extractToolUses(content);
-      if (toolUses.length) {
-        debug.tool_use_detected = true;
+      if (contentInspection.tool_use_detected) {
+        codeToolUsed = true;
         debug.parser_stage_reached = 'detected_tool_use';
       }
-      debug.tool_use_count += toolUses.length;
 
       if (toolUses.length > 0) {
-        codeToolUsed = true;
         const toolResultBlocks = [];
         for (const toolUse of toolUses) {
           const toolName = String(toolUse?.name || '').trim();
@@ -586,14 +621,22 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
             tool_use_id: toolUse.id,
             content: toolOutput
           });
-          debug.tool_result_count += 1;
-          debug.tool_result_detected = true;
           debug.parser_stage_reached = 'detected_tool_result';
         }
 
         apiConversation.push({
           role: 'user',
           content: toolResultBlocks
+        });
+        continue;
+      }
+
+      if (contentInspection.server_tool_use_detected) {
+        debug.finalization_call_made = true;
+        logs.push('Detected server-side tool execution; requesting final JSON payload...');
+        apiConversation.push({
+          role: 'user',
+          content: [{ type: 'text', text: buildFinalizationInstruction() }]
         });
         continue;
       }
@@ -742,7 +785,9 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
 
   if (!finalPayload) {
     debug.parser_stage_reached = 'built_fallback_response';
-    debug.tool_chain_valid = debug.tool_use_count === debug.tool_result_count;
+    debug.tool_chain_valid = debug.tool_use_detected
+      ? debug.tool_result_detected || debug.server_tool_use_detected || codeToolUsed
+      : true;
     const partialWarnings = [
       ...allWarnings,
       'Dynamic response was partial/unstructured. Returning best-effort result.'
@@ -756,7 +801,7 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     }
 
     executionMode = 'dynamic_agent_execution_partial';
-    debug.outcome = codeToolUsed
+    debug.outcome = codeToolUsed || debug.server_tool_use_detected
       ? 'execution_succeeded_final_formatting_failed'
       : 'execution_failed';
 
@@ -820,12 +865,14 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
   if (!codeToolUsed) {
     allWarnings.push('No explicit code-execution tool output detected; verify Anthropic tool availability.');
   }
-  debug.outcome = codeToolUsed
+  debug.outcome = codeToolUsed || debug.server_tool_use_detected
     ? debug.final_json_detected
       ? 'final_json_succeeded'
       : 'execution_succeeded_final_formatting_failed'
     : 'execution_failed';
-  debug.tool_chain_valid = debug.tool_use_count === debug.tool_result_count;
+  debug.tool_chain_valid = debug.tool_use_detected
+    ? debug.tool_result_detected || debug.server_tool_use_detected || codeToolUsed
+    : true;
 
   const inputRows = validation.rows_input ?? getInputRowCount(resolvedCsvText);
 
