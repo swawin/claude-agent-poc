@@ -124,6 +124,19 @@ export default function App() {
           <strong>Validation status:</strong> {metadata.validation_passed ? 'Passed' : 'Failed'}
         </p>
       )}
+      {debug && (
+        <>
+          <p>
+            <strong>Finalization call made:</strong> {debug.finalization_call_made ? 'Yes' : 'No'}
+          </p>
+          <p>
+            <strong>Final JSON detected:</strong> {debug.final_json_detected ? 'Yes' : 'No'}
+          </p>
+          <p>
+            <strong>Cleaned CSV row count:</strong> {debug.cleaned_csv_row_count ?? 0}
+          </p>
+        </>
+      )}
 
       {metadata?.fallback_plan_used && (
         <p>
