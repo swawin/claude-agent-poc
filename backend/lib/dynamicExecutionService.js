@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { validateDynamicCsvResult, getInputRowCount } from './dynamicValidation.js';
 
-const MAX_ITERATIONS = 2;
+const MAX_EXECUTION_ATTEMPTS = 2;
 const DEFAULT_MODEL = 'claude-sonnet-4-5';
 const MAX_RAW_EXCERPT = 700;
 const CSV_DEBUG_PREVIEW_LENGTH = 200;
@@ -32,15 +32,75 @@ function extractPlanText(text = '') {
 }
 
 function parseJsonObject(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) {
-      throw new Error('Claude did not return a JSON object.');
-    }
-    return JSON.parse(match[0]);
+  const normalized = String(text || '').trim();
+  if (!normalized) {
+    throw new Error('Claude did not return any JSON content.');
   }
+
+  const stripped = normalized
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  try {
+    return JSON.parse(stripped);
+  } catch {
+    // Continue to first valid JSON-object extraction.
+  }
+
+  const start = stripped.indexOf('{');
+  if (start === -1) {
+    throw new Error('Claude did not return a JSON object.');
+  }
+
+  for (let i = start; i < stripped.length; i += 1) {
+    if (stripped[i] !== '{') continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let j = i; j < stripped.length; j += 1) {
+      const ch = stripped[j];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === '{') depth += 1;
+      if (ch === '}') depth -= 1;
+      if (depth === 0) {
+        const candidate = stripped.slice(i, j + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+
+  throw new Error('Claude did not return parseable JSON.');
+}
+
+function pickFinalPayloadShape(candidate = {}) {
+  if (!candidate || typeof candidate !== 'object') return {};
+  if (candidate.cleaned_csv || candidate.summary || candidate.metadata) return candidate;
+  const nestedCandidates = [candidate.result, candidate.final_result, candidate.output, candidate.payload];
+  for (const nested of nestedCandidates) {
+    if (nested && typeof nested === 'object' && (nested.cleaned_csv || nested.summary || nested.metadata)) {
+      return nested;
+    }
+  }
+  return candidate;
 }
 
 function sanitizeRawExcerpt(value = '') {
@@ -73,21 +133,30 @@ function countByTypes(content = [], types = []) {
 }
 
 function normalizePayload(candidate = {}) {
+  const selected = pickFinalPayloadShape(candidate);
+  const metadata = selected.metadata && typeof selected.metadata === 'object' ? selected.metadata : {};
   return {
-    plan: typeof candidate.plan === 'string' ? candidate.plan : '',
-    summary: typeof candidate.summary === 'string' ? candidate.summary : '',
-    cleaned_csv: typeof candidate.cleaned_csv === 'string' ? candidate.cleaned_csv : '',
+    plan: typeof selected.plan === 'string' ? selected.plan : '',
+    summary: typeof selected.summary === 'string' ? selected.summary : '',
+    cleaned_csv: typeof selected.cleaned_csv === 'string' ? selected.cleaned_csv : '',
     generated_code_excerpt:
-      typeof candidate.generated_code_excerpt === 'string' ? candidate.generated_code_excerpt : '',
-    warnings: Array.isArray(candidate.warnings) ? candidate.warnings.map(String) : [],
-    validation_notes: Array.isArray(candidate.validation_notes)
-      ? candidate.validation_notes.map(String)
+      typeof selected.generated_code_excerpt === 'string' ? selected.generated_code_excerpt : '',
+    warnings: Array.isArray(selected.warnings) ? selected.warnings.map(String) : [],
+    validation_notes: Array.isArray(selected.validation_notes)
+      ? selected.validation_notes.map(String)
       : [],
     per_user_summary:
-      candidate.per_user_summary && typeof candidate.per_user_summary === 'object'
-        ? candidate.per_user_summary
+      selected.per_user_summary && typeof selected.per_user_summary === 'object'
+        ? selected.per_user_summary
         : null,
-    anomalies: Array.isArray(candidate.anomalies) ? candidate.anomalies : []
+    anomalies: Array.isArray(selected.anomalies) ? selected.anomalies : [],
+    metadata: {
+      rows_input: Number.isFinite(metadata.rows_input) ? Number(metadata.rows_input) : null,
+      rows_output: Number.isFinite(metadata.rows_output) ? Number(metadata.rows_output) : null,
+      duplicates_removed: Number.isFinite(metadata.duplicates_removed) ? Number(metadata.duplicates_removed) : null,
+      dates_normalized: Number.isFinite(metadata.dates_normalized) ? Number(metadata.dates_normalized) : null,
+      validation_passed: typeof metadata.validation_passed === 'boolean' ? metadata.validation_passed : null
+    }
   };
 }
 
@@ -116,6 +185,33 @@ function buildSystemPrompt() {
     '  "validation_notes": ["string"],',
     '  "per_user_summary": {"optional": "object if requested, else {}"},',
     '  "anomalies": ["optional anomaly descriptions if requested, else []"]',
+    '}'
+  ].join('\n');
+}
+
+function buildFinalizationInstruction() {
+  return [
+    'You have already analyzed and executed code on the provided CSV content.',
+    'Now return ONLY a strict JSON object with the final computed results.',
+    'Do not include prose, markdown, or code fences.',
+    'The JSON must contain:',
+    '- cleaned_csv',
+    '- summary',
+    '- warnings',
+    '- metadata',
+    'If cleaned_csv is empty, the response is invalid.',
+    'Required shape:',
+    '{',
+    '  "cleaned_csv": "<non-empty csv text>",',
+    '  "summary": "<grounded summary>",',
+    '  "warnings": [],',
+    '  "metadata": {',
+    '    "rows_input": number,',
+    '    "rows_output": number,',
+    '    "duplicates_removed": number,',
+    '    "dates_normalized": number,',
+    '    "validation_passed": boolean',
+    '  }',
     '}'
   ].join('\n');
 }
@@ -186,14 +282,14 @@ async function tryFormattingRepair({ anthropic, model, textToRepair, debug }) {
       max_tokens: 1200,
       temperature: 0,
       system:
-        'Convert the provided execution output into one strict JSON object with keys: plan, summary, cleaned_csv, generated_code_excerpt, warnings, validation_notes. Return JSON only.',
+        'Return only valid JSON. No prose. No markdown. No code fences.',
       messages: [
         {
           role: 'user',
           content: [
             {
               type: 'text',
-              text: `Convert this content to the required JSON shape. If a field is missing, use empty string or empty array.\n\n${textToRepair}`
+              text: `Repair this into strict JSON using this shape: {"cleaned_csv":"","summary":"","warnings":[],"metadata":{"rows_input":0,"rows_output":0,"duplicates_removed":0,"dates_normalized":0,"validation_passed":false}}\n\n${textToRepair}`
             }
           ]
         }
@@ -259,9 +355,10 @@ function isGenericSummary(summary = '', rowsInput = 0, rowsOutput = 0) {
   if (!summary?.trim()) return true;
   const normalized = summary.toLowerCase();
   if (/no specific csv file was provided/.test(normalized)) return true;
-  const mentionsInput = rowsInput > 0 ? normalized.includes(String(rowsInput)) : true;
-  const mentionsOutput = rowsOutput > 0 ? normalized.includes(String(rowsOutput)) : true;
-  return !(mentionsInput || mentionsOutput);
+  const mentionsInput = rowsInput > 0 ? normalized.includes(String(rowsInput)) : false;
+  const mentionsOutput = rowsOutput > 0 ? normalized.includes(String(rowsOutput)) : false;
+  const hasNumbers = /\b\d+\b/.test(normalized);
+  return !(mentionsInput || mentionsOutput || hasNumbers);
 }
 
 export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey, model }) {
@@ -308,7 +405,13 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     csv_preview: resolvedCsvText.slice(0, CSV_DEBUG_PREVIEW_LENGTH),
     placeholder_file_access_detected: false,
     missing_csv_claim_detected: false,
-    cleaned_csv_empty: false
+    cleaned_csv_empty: false,
+    server_tool_use_detected: false,
+    finalization_call_made: false,
+    final_json_detected: false,
+    cleaned_csv_header_detected: false,
+    cleaned_csv_row_count: 0,
+    outcome: 'execution_not_completed'
   };
 
   let finalPayload = null;
@@ -319,12 +422,26 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
   let fallbackArtifacts = { plan: '', generated_code: '' };
   let correctionMessage = '';
 
-  for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
+  for (let iteration = 1; iteration <= MAX_EXECUTION_ATTEMPTS; iteration += 1) {
     iterationsUsed = iteration;
-    logs.push(`Generating transformation code (iteration ${iteration}/${MAX_ITERATIONS})...`);
+    logs.push(`Generating transformation code (iteration ${iteration}/${MAX_EXECUTION_ATTEMPTS})...`);
     logs.push('Executing code in Anthropic sandbox...');
 
     let message;
+    const conversation = [
+      {
+        role: 'user',
+        content: buildUserPrompt({
+          task: taskText,
+          csvText: resolvedCsvText,
+          iteration,
+          maxIterations: MAX_EXECUTION_ATTEMPTS,
+          priorFailures: validation?.failures,
+          priorOutput: finalPayload?.cleaned_csv,
+          correctionMessage
+        })
+      }
+    ];
     try {
       message = await anthropic.messages.create({
         model: model || DEFAULT_MODEL,
@@ -332,20 +449,7 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
         temperature: 0,
         system: buildSystemPrompt(),
         tools: anthropicTools,
-        messages: [
-          {
-            role: 'user',
-            content: buildUserPrompt({
-              task: taskText,
-              csvText: resolvedCsvText,
-              iteration,
-              maxIterations: MAX_ITERATIONS,
-              priorFailures: validation?.failures,
-              priorOutput: finalPayload?.cleaned_csv,
-              correctionMessage
-            })
-          }
-        ]
+        messages: conversation
       });
       debug.parser_stage_reached = 'received_response';
     } catch (error) {
@@ -364,6 +468,8 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     debug.tool_use_count += toolUseCount;
     debug.tool_result_count += toolResultCount;
     debug.tool_use_detected = debug.tool_use_detected || hasToolUse(content);
+    debug.server_tool_use_detected =
+      debug.server_tool_use_detected || content.some((block) => block?.type === 'server_tool_use');
     debug.tool_result_detected = debug.tool_result_detected || hasToolResult(content);
     if (debug.tool_use_detected) debug.parser_stage_reached = 'detected_tool_use';
     if (debug.tool_result_detected) debug.parser_stage_reached = 'detected_tool_result';
@@ -391,16 +497,73 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       generated_code: extractCodeBlocks(responseText)
     };
 
+    let candidatePayload = null;
+    let parsedFirstPass = false;
     try {
-      const candidate = normalizePayload(parseJsonObject(responseText));
-      debug.parser_stage_reached = 'parsed_structured_json';
-      finalPayload = candidate;
+      candidatePayload = normalizePayload(parseJsonObject(responseText));
+      parsedFirstPass = true;
     } catch (error) {
       debug.parser_error = error.message;
+    }
+
+    const hasExecutionEvidence = debug.tool_use_detected || debug.tool_result_detected;
+    const firstPassMissingFinalJson =
+      !parsedFirstPass || !candidatePayload?.cleaned_csv || !candidatePayload?.summary;
+
+    if (hasExecutionEvidence && firstPassMissingFinalJson) {
+      logs.push('Execution detected; issuing finalization call for strict JSON result...');
+      debug.finalization_call_made = true;
+      const finalizationPrompt = buildFinalizationInstruction();
+      let finalizationResponse;
+      try {
+        finalizationResponse = await anthropic.messages.create({
+          model: model || DEFAULT_MODEL,
+          max_tokens: 1400,
+          temperature: 0,
+          system: buildSystemPrompt(),
+          tools: anthropicTools,
+          messages: [
+            ...conversation,
+            { role: 'assistant', content },
+            { role: 'user', content: finalizationPrompt }
+          ]
+        });
+      } catch (error) {
+        debug.parser_error = `Finalization call failed: ${error?.message || 'Unknown error'}`;
+      }
+
+      const finalizationContent = Array.isArray(finalizationResponse?.content)
+        ? finalizationResponse.content
+        : [];
+      if (finalizationContent.length) {
+        debug.raw_content_types = Array.from(
+          new Set([...debug.raw_content_types, ...collectRawContentTypes(finalizationContent)])
+        );
+        const finalizationText = extractTextBlocks(finalizationContent);
+        if (finalizationText) {
+          finalText = finalizationText;
+          debug.raw_response_excerpt = sanitizeRawExcerpt(finalizationText);
+          try {
+            candidatePayload = normalizePayload(parseJsonObject(finalizationText));
+            parsedFirstPass = true;
+            debug.final_json_detected = true;
+          } catch (error) {
+            debug.parser_error = `Finalization parse failed: ${error?.message || 'Unknown parse error'}`;
+          }
+        }
+      }
+    } else if (parsedFirstPass) {
+      debug.final_json_detected = true;
+    }
+
+    if (!parsedFirstPass || !candidatePayload) {
       logs.push(`Claude returned unstructured text on iteration ${iteration}; attempting fallback handling...`);
       allWarnings.push('Claude response was not strict JSON; building partial dynamic response.');
       continue;
     }
+
+    debug.parser_stage_reached = 'parsed_structured_json';
+    finalPayload = candidatePayload;
 
     if (!finalPayload.cleaned_csv) {
       debug.cleaned_csv_empty = true;
@@ -484,8 +647,7 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     }
 
     logs.push(`Validation failed: ${validation.failures.join(' ')} Retrying...`);
-    correctionMessage =
-      'You were already given CSV content. You must use it. Do not use external filenames. Use csv_text and StringIO(csv_text) only.';
+    correctionMessage = 'Return only valid JSON. No prose. No markdown. No code fences.';
   }
 
   if (!finalPayload && finalText) {
@@ -521,6 +683,9 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     }
 
     executionMode = 'dynamic_agent_execution_partial';
+    debug.outcome = codeToolUsed
+      ? 'execution_succeeded_final_formatting_failed'
+      : 'execution_failed';
 
     console.log('[execute-dynamic] parser_stage_reached:', debug.parser_stage_reached);
     console.log('[execute-dynamic] raw_content_types:', debug.raw_content_types);
@@ -563,12 +728,30 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
 
   const cleanedCsvText = (finalPayload.cleaned_csv || '').trim();
   debug.cleaned_csv_empty = !cleanedCsvText;
+  const csvLines = cleanedCsvText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  debug.cleaned_csv_header_detected = csvLines.length > 0;
+  debug.cleaned_csv_row_count = Math.max(csvLines.length - 1, 0);
+  if (typeof validation.cleaned_csv_header_detected === 'boolean') {
+    debug.cleaned_csv_header_detected = validation.cleaned_csv_header_detected;
+  }
+  if (typeof validation.rows_output === 'number') {
+    debug.cleaned_csv_row_count = validation.rows_output;
+  }
+  debug.final_json_detected = debug.final_json_detected || Boolean(finalPayload.cleaned_csv || finalPayload.summary);
   const summary = finalPayload.summary ? `Summary:\n${finalPayload.summary}` : 'Summary:\nNo summary returned.';
   const result = `${cleanedCsvText}\n\n${summary}`.trim();
 
   if (!codeToolUsed) {
     allWarnings.push('No explicit code-execution tool output detected; verify Anthropic tool availability.');
   }
+  debug.outcome = codeToolUsed
+    ? debug.final_json_detected
+      ? 'final_json_succeeded'
+      : 'execution_succeeded_final_formatting_failed'
+    : 'execution_failed';
 
   const inputRows = validation.rows_input ?? getInputRowCount(resolvedCsvText);
 
@@ -585,8 +768,8 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       execution_mode: executionMode,
       rows_input: inputRows,
       rows_output: validation.rows_output ?? 0,
-      duplicates_removed: validation.duplicates_removed,
-      dates_normalized: validation.dates_normalized,
+      duplicates_removed: finalPayload.metadata.duplicates_removed ?? validation.duplicates_removed,
+      dates_normalized: finalPayload.metadata.dates_normalized ?? validation.dates_normalized,
       validation_passed: validation.passed,
       iterations_used: iterationsUsed,
       warnings: Array.from(new Set(allWarnings.filter(Boolean))),

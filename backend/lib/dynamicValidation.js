@@ -69,6 +69,13 @@ export function validateDynamicCsvResult({ task, inputCsv, outputCsv }) {
     failures.push('Output CSV is empty.');
   }
 
+  const outputHeader = Array.isArray(outputRows?.[0]) ? outputRows[0] : [];
+  const hasHeaderRow =
+    outputHeader.length > 0 && outputHeader.some((cell) => String(cell ?? '').trim().length > 0);
+  if (!hasHeaderRow) {
+    failures.push('Output CSV header row is missing or empty.');
+  }
+
   if (rowsOutput === 0) {
     failures.push('Output CSV has no data rows.');
   }
@@ -120,6 +127,7 @@ export function validateDynamicCsvResult({ task, inputCsv, outputCsv }) {
     failures,
     rows_input: rowsInput,
     rows_output: rowsOutput,
+    cleaned_csv_header_detected: hasHeaderRow,
     duplicates_removed: requestedDuplicateRemoval ? duplicatesRemoved : null,
     dates_normalized: requestedDateNormalization ? datesNormalized ?? 0 : null
   };
