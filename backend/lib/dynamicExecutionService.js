@@ -1,10 +1,15 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { validateDynamicCsvResult, getInputRowCount } from './dynamicValidation.js';
 
+const execFileAsync = promisify(execFile);
 const MAX_EXECUTION_ATTEMPTS = 2;
+const MAX_TOOL_LOOP_ITERATIONS = 5;
 const DEFAULT_MODEL = 'claude-sonnet-4-5';
 const MAX_RAW_EXCERPT = 700;
 const CSV_DEBUG_PREVIEW_LENGTH = 200;
+const MAX_TOOL_OUTPUT_CHARS = 6000;
 
 
 function extractTextBlocks(content) {
@@ -130,6 +135,73 @@ function hasToolResult(content = []) {
 
 function countByTypes(content = [], types = []) {
   return content.filter((block) => types.includes(block?.type)).length;
+}
+
+function extractToolUses(content = []) {
+  return content.filter((block) => block?.type === 'tool_use' && block?.name);
+}
+
+function extractGeneratedCode(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return '';
+  if (typeof toolInput.code === 'string') return toolInput.code;
+  if (typeof toolInput.source === 'string') return toolInput.source;
+  if (typeof toolInput.script === 'string') return toolInput.script;
+  return '';
+}
+
+function buildSandboxWrapper(code = '') {
+  return `
+import contextlib
+import io
+import traceback
+
+_stdout = io.StringIO()
+_stderr = io.StringIO()
+_globals = {"__name__": "__main__"}
+_locals = {}
+
+with contextlib.redirect_stdout(_stdout), contextlib.redirect_stderr(_stderr):
+    try:
+${code
+  .split('\n')
+  .map((line) => `        ${line}`)
+  .join('\n')}
+    except Exception:
+        traceback.print_exc()
+
+out = _stdout.getvalue()
+err = _stderr.getvalue()
+print(out, end="")
+if err:
+    print("\\n[stderr]\\n" + err, end="")
+`.trim();
+}
+
+async function runCodeExecutionTool({ code, toolName }) {
+  if (toolName !== 'code_execution') {
+    return `Unsupported tool: ${toolName}`;
+  }
+
+  if (!code.trim()) {
+    return 'No executable code provided by Claude.';
+  }
+
+  try {
+    const wrapped = buildSandboxWrapper(code);
+    const { stdout, stderr } = await execFileAsync('python3', ['-I', '-c', wrapped], {
+      timeout: 15000,
+      maxBuffer: 1024 * 1024,
+      env: {},
+      cwd: '/tmp'
+    });
+    const output = `${stdout || ''}${stderr ? `\n[python-stderr]\n${stderr}` : ''}`.trim();
+    return (output || '[no output]').slice(0, MAX_TOOL_OUTPUT_CHARS);
+  } catch (error) {
+    const stdout = typeof error?.stdout === 'string' ? error.stdout : '';
+    const stderr = typeof error?.stderr === 'string' ? error.stderr : '';
+    const details = [stdout, stderr, error?.message].filter(Boolean).join('\n').trim();
+    return (`Execution failed:\n${details || 'Unknown execution error.'}`).slice(0, MAX_TOOL_OUTPUT_CHARS);
+  }
 }
 
 function normalizePayload(candidate = {}) {
@@ -411,6 +483,8 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     final_json_detected: false,
     cleaned_csv_header_detected: false,
     cleaned_csv_row_count: 0,
+    loop_iterations: 0,
+    tool_chain_valid: false,
     outcome: 'execution_not_completed'
   };
 
@@ -427,133 +501,131 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
     logs.push(`Generating transformation code (iteration ${iteration}/${MAX_EXECUTION_ATTEMPTS})...`);
     logs.push('Executing code in Anthropic sandbox...');
 
-    let message;
-    const conversation = [
+    const promptText = buildUserPrompt({
+      task: taskText,
+      csvText: resolvedCsvText,
+      iteration,
+      maxIterations: MAX_EXECUTION_ATTEMPTS,
+      priorFailures: validation?.failures,
+      priorOutput: finalPayload?.cleaned_csv,
+      correctionMessage
+    });
+
+    const apiConversation = [
       {
         role: 'user',
-        content: buildUserPrompt({
-          task: taskText,
-          csvText: resolvedCsvText,
-          iteration,
-          maxIterations: MAX_EXECUTION_ATTEMPTS,
-          priorFailures: validation?.failures,
-          priorOutput: finalPayload?.cleaned_csv,
-          correctionMessage
-        })
+        content: [{ type: 'text', text: promptText }]
       }
     ];
-    try {
-      message = await anthropic.messages.create({
-        model: model || DEFAULT_MODEL,
-        max_tokens: 1800,
-        temperature: 0,
-        system: buildSystemPrompt(),
-        tools: anthropicTools,
-        messages: conversation
-      });
-      debug.parser_stage_reached = 'received_response';
-    } catch (error) {
-      const details = error?.message || 'Unknown Anthropic error';
-      throw new Error(`Dynamic Claude execution failed: ${details}`);
-    }
-
-    const content = Array.isArray(message.content) ? message.content : [];
-    debug.raw_content_types = Array.from(new Set([...debug.raw_content_types, ...collectRawContentTypes(content)]));
-    const toolUseCount = countByTypes(content, ['tool_use', 'server_tool_use']);
-    const toolResultCount = countByTypes(content, [
-      'tool_result',
-      'code_execution_tool_result',
-      'web_search_tool_result'
-    ]);
-    debug.tool_use_count += toolUseCount;
-    debug.tool_result_count += toolResultCount;
-    debug.tool_use_detected = debug.tool_use_detected || hasToolUse(content);
-    debug.server_tool_use_detected =
-      debug.server_tool_use_detected || content.some((block) => block?.type === 'server_tool_use');
-    debug.tool_result_detected = debug.tool_result_detected || hasToolResult(content);
-    if (debug.tool_use_detected) debug.parser_stage_reached = 'detected_tool_use';
-    if (debug.tool_result_detected) debug.parser_stage_reached = 'detected_tool_result';
-
-    if (typeof message?.stop_reason === 'string') {
-      debug.raw_stop_reason = message.stop_reason;
-    }
-
-    if (debug.tool_use_detected || debug.tool_result_detected) {
-      codeToolUsed = true;
-    }
-
-    const responseText = extractTextBlocks(content);
-    if (!responseText) {
-      logs.push('Claude returned no text payload; retrying...');
-      continue;
-    }
-
-    finalText = responseText;
-    debug.raw_response_excerpt = sanitizeRawExcerpt(responseText);
-    debug.parser_stage_reached = 'parsed_final_text';
-
-    fallbackArtifacts = {
-      plan: extractPlanText(responseText),
-      generated_code: extractCodeBlocks(responseText)
-    };
+    const toolConversation = [
+      {
+        role: 'user',
+        content: promptText
+      }
+    ];
 
     let candidatePayload = null;
     let parsedFirstPass = false;
-    try {
-      candidatePayload = normalizePayload(parseJsonObject(responseText));
-      parsedFirstPass = true;
-    } catch (error) {
-      debug.parser_error = error.message;
-    }
+    let responseText = '';
+    let hitToolLoopCap = false;
 
-    const hasExecutionEvidence = debug.tool_use_detected || debug.tool_result_detected;
-    const firstPassMissingFinalJson =
-      !parsedFirstPass || !candidatePayload?.cleaned_csv || !candidatePayload?.summary;
+    for (let loopIteration = 1; loopIteration <= MAX_TOOL_LOOP_ITERATIONS; loopIteration += 1) {
+      if (debug.loop_iterations >= MAX_TOOL_LOOP_ITERATIONS) {
+        break;
+      }
+      debug.loop_iterations += 1;
 
-    if (hasExecutionEvidence && firstPassMissingFinalJson) {
-      logs.push('Execution detected; issuing finalization call for strict JSON result...');
-      debug.finalization_call_made = true;
-      const finalizationPrompt = buildFinalizationInstruction();
-      let finalizationResponse;
+      let message;
       try {
-        finalizationResponse = await anthropic.messages.create({
+        message = await anthropic.messages.create({
           model: model || DEFAULT_MODEL,
-          max_tokens: 1400,
+          max_tokens: 1800,
           temperature: 0,
           system: buildSystemPrompt(),
           tools: anthropicTools,
-          messages: [
-            ...conversation,
-            { role: 'assistant', content },
-            { role: 'user', content: finalizationPrompt }
-          ]
+          messages: apiConversation
         });
+        debug.parser_stage_reached = 'received_response';
       } catch (error) {
-        debug.parser_error = `Finalization call failed: ${error?.message || 'Unknown error'}`;
+        const details = error?.message || 'Unknown Anthropic error';
+        throw new Error(`Dynamic Claude execution failed: ${details}`);
       }
 
-      const finalizationContent = Array.isArray(finalizationResponse?.content)
-        ? finalizationResponse.content
-        : [];
-      if (finalizationContent.length) {
-        debug.raw_content_types = Array.from(
-          new Set([...debug.raw_content_types, ...collectRawContentTypes(finalizationContent)])
-        );
-        const finalizationText = extractTextBlocks(finalizationContent);
-        if (finalizationText) {
-          finalText = finalizationText;
-          debug.raw_response_excerpt = sanitizeRawExcerpt(finalizationText);
-          try {
-            candidatePayload = normalizePayload(parseJsonObject(finalizationText));
-            parsedFirstPass = true;
-            debug.final_json_detected = true;
-          } catch (error) {
-            debug.parser_error = `Finalization parse failed: ${error?.message || 'Unknown parse error'}`;
-          }
+      const content = Array.isArray(message.content) ? message.content : [];
+      debug.raw_content_types = Array.from(new Set([...debug.raw_content_types, ...collectRawContentTypes(content)]));
+      if (typeof message?.stop_reason === 'string') {
+        debug.raw_stop_reason = message.stop_reason;
+      }
+
+      apiConversation.push({ role: 'assistant', content });
+      toolConversation.push({ role: 'assistant', content });
+
+      const toolUses = extractToolUses(content);
+      if (toolUses.length) {
+        debug.tool_use_detected = true;
+        debug.parser_stage_reached = 'detected_tool_use';
+      }
+      debug.tool_use_count += toolUses.length;
+
+      if (toolUses.length > 0) {
+        codeToolUsed = true;
+        const toolResultBlocks = [];
+        for (const toolUse of toolUses) {
+          const toolName = String(toolUse?.name || '').trim();
+          const generatedCode = extractGeneratedCode(toolUse?.input);
+          const toolOutput = await runCodeExecutionTool({ code: generatedCode, toolName });
+
+          toolConversation.push({
+            role: 'tool',
+            tool_name: toolName,
+            content: toolOutput
+          });
+
+          toolResultBlocks.push({
+            type: 'tool_result',
+            tool_use_id: toolUse.id,
+            content: toolOutput
+          });
+          debug.tool_result_count += 1;
+          debug.tool_result_detected = true;
+          debug.parser_stage_reached = 'detected_tool_result';
+        }
+
+        apiConversation.push({
+          role: 'user',
+          content: toolResultBlocks
+        });
+        continue;
+      }
+
+      responseText = extractTextBlocks(content);
+      if (!responseText) {
+        logs.push('Claude returned no text payload; retrying...');
+      } else {
+        finalText = responseText;
+        debug.raw_response_excerpt = sanitizeRawExcerpt(responseText);
+        debug.parser_stage_reached = 'parsed_final_text';
+        fallbackArtifacts = {
+          plan: extractPlanText(responseText),
+          generated_code: extractCodeBlocks(responseText)
+        };
+
+        try {
+          candidatePayload = normalizePayload(parseJsonObject(responseText));
+          parsedFirstPass = true;
+          debug.final_json_detected = true;
+        } catch (error) {
+          debug.parser_error = error.message;
         }
       }
-    } else if (parsedFirstPass) {
-      debug.final_json_detected = true;
+      break;
+    }
+
+    if (!parsedFirstPass && !responseText) {
+      hitToolLoopCap = debug.loop_iterations >= MAX_TOOL_LOOP_ITERATIONS;
+      if (hitToolLoopCap) {
+        allWarnings.push(`Reached max tool loop iterations (${MAX_TOOL_LOOP_ITERATIONS}) without final response.`);
+      }
     }
 
     if (!parsedFirstPass || !candidatePayload) {
@@ -670,6 +742,7 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
 
   if (!finalPayload) {
     debug.parser_stage_reached = 'built_fallback_response';
+    debug.tool_chain_valid = debug.tool_use_count === debug.tool_result_count;
     const partialWarnings = [
       ...allWarnings,
       'Dynamic response was partial/unstructured. Returning best-effort result.'
@@ -752,6 +825,7 @@ export async function executeDynamicCsvTask({ task, csvText, fileBuffer, apiKey,
       ? 'final_json_succeeded'
       : 'execution_succeeded_final_formatting_failed'
     : 'execution_failed';
+  debug.tool_chain_valid = debug.tool_use_count === debug.tool_result_count;
 
   const inputRows = validation.rows_input ?? getInputRowCount(resolvedCsvText);
 
