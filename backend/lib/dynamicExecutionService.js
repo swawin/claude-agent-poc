@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { validateDynamicCsvResult, getInputRowCount } from './dynamicValidation.js';
 
-const MAX_ITERATIONS = 3;
+const MAX_ITERATIONS = 2;
 const DEFAULT_MODEL = 'claude-sonnet-4-5';
 const MAX_RAW_EXCERPT = 700;
 
@@ -81,15 +81,24 @@ function normalizePayload(candidate = {}) {
     warnings: Array.isArray(candidate.warnings) ? candidate.warnings.map(String) : [],
     validation_notes: Array.isArray(candidate.validation_notes)
       ? candidate.validation_notes.map(String)
-      : []
+      : [],
+    per_user_summary:
+      candidate.per_user_summary && typeof candidate.per_user_summary === 'object'
+        ? candidate.per_user_summary
+        : null,
+    anomalies: Array.isArray(candidate.anomalies) ? candidate.anomalies : []
   };
 }
 
 function buildSystemPrompt() {
   return [
     'You are a bounded dynamic CSV execution agent.',
-    'Inspect CSV text, create a plan, write transformation code, execute it with the code execution tool, inspect output, then return final JSON.',
+    'Inspect inline CSV text, create a plan, write transformation code, execute it with the code execution tool, inspect output, then return final JSON.',
     'You MUST use the code execution tool before finalizing when CSV is provided.',
+    'The CSV is provided inline in the user message and is the only source of truth.',
+    'Load the CSV from the provided string (e.g., io.StringIO + pandas.read_csv).',
+    'Do NOT read files like data.csv or any other placeholder/local filename.',
+    'Do not describe what you would do. Do not return generic templates.',
     'Do not fabricate successful execution. If execution fails, explain and retry with revised code.',
     'Preserve uncertain/invalid values and provide warnings instead of silently forcing a fix.',
     'After any tool-use content, always end with one strict JSON object and no extra text.',
@@ -100,17 +109,29 @@ function buildSystemPrompt() {
     '  "cleaned_csv": "string",',
     '  "generated_code_excerpt": "string",',
     '  "warnings": ["string"],',
-    '  "validation_notes": ["string"]',
+    '  "validation_notes": ["string"],',
+    '  "per_user_summary": {"optional": "object if requested, else {}"},',
+    '  "anomalies": ["optional anomaly descriptions if requested, else []"]',
     '}'
   ].join('\n');
 }
 
-function buildUserPrompt({ task, csvText, iteration, maxIterations, priorFailures, priorOutput }) {
+function buildUserPrompt({
+  task,
+  csvText,
+  iteration,
+  maxIterations,
+  priorFailures,
+  priorOutput,
+  correctionMessage
+}) {
   const sections = [
     `Task: ${task || 'Clean and normalize this CSV.'}`,
     `Iteration: ${iteration} of ${maxIterations}`,
-    'CSV input (raw text):',
-    csvText
+    'CSV input (raw text, inline, source of truth):',
+    '<csv_inline>',
+    csvText,
+    '</csv_inline>'
   ];
 
   if (priorOutput) {
@@ -120,12 +141,18 @@ function buildUserPrompt({ task, csvText, iteration, maxIterations, priorFailure
   if (priorFailures?.length) {
     sections.push('', 'Validation failures from backend that must be fixed:', ...priorFailures.map((f) => `- ${f}`));
   }
+  if (correctionMessage) {
+    sections.push('', 'Correction instructions (must follow exactly):', correctionMessage);
+  }
 
   sections.push(
     '',
     'Requirements:',
     '- Analyze structure and provide a concise plan.',
-    '- Write code and execute it with the code execution tool.',
+    '- Write executable Python code and execute it with the code execution tool.',
+    '- Build DataFrame from the provided inline CSV string, not from a filename.',
+    '- Do not use placeholder filenames such as data.csv.',
+    '- If execution succeeds, return actual computed results.',
     '- Return cleaned CSV with headers and data rows.',
     '- If task asks for deduplication/date normalization/missing value handling, satisfy that behavior.',
     '- Keep CSV valid and parseable.',
@@ -201,6 +228,20 @@ function buildAdvisoryResponse(task = '') {
   };
 }
 
+function detectPlaceholderFileAccess(text = '') {
+  if (!text) return false;
+  return /pd\.read_csv\(\s*["'](?:data|input|output|cleaned|sample|test|file)\.csv["']\s*\)/i.test(text);
+}
+
+function isGenericSummary(summary = '', rowsInput = 0, rowsOutput = 0) {
+  if (!summary?.trim()) return true;
+  const normalized = summary.toLowerCase();
+  if (/no specific csv file was provided/.test(normalized)) return true;
+  const mentionsInput = rowsInput > 0 ? normalized.includes(String(rowsInput)) : true;
+  const mentionsOutput = rowsOutput > 0 ? normalized.includes(String(rowsOutput)) : true;
+  return !(mentionsInput || mentionsOutput);
+}
+
 export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model }) {
   const taskText = (task || '').trim();
   if (!fileBuffer) {
@@ -241,7 +282,10 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     raw_content_types: [],
     raw_response_excerpt: '',
     parser_stage_reached: '',
-    parser_error: null
+    parser_error: null,
+    csv_inline_provided: true,
+    placeholder_file_access_detected: false,
+    cleaned_csv_empty: false
   };
 
   let finalPayload = null;
@@ -250,6 +294,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
   let iterationsUsed = 0;
   let codeToolUsed = false;
   let fallbackArtifacts = { plan: '', generated_code: '' };
+  let correctionMessage = '';
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration += 1) {
     iterationsUsed = iteration;
@@ -273,7 +318,8 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
               iteration,
               maxIterations: MAX_ITERATIONS,
               priorFailures: validation?.failures,
-              priorOutput: finalPayload?.cleaned_csv
+              priorOutput: finalPayload?.cleaned_csv,
+              correctionMessage
             })
           }
         ]
@@ -334,8 +380,31 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     }
 
     if (!finalPayload.cleaned_csv) {
+      debug.cleaned_csv_empty = true;
       logs.push(`Candidate output missing cleaned_csv on iteration ${iteration}; retrying...`);
       allWarnings.push('Claude response missing cleaned_csv field.');
+      correctionMessage =
+        'You must use the inline CSV content already provided. Do not use external filenames. Return actual cleaned CSV text and structured JSON only.';
+      continue;
+    }
+
+    const placeholderDetected = detectPlaceholderFileAccess(
+      [finalPayload.generated_code_excerpt, fallbackArtifacts.generated_code, responseText].filter(Boolean).join('\n')
+    );
+    debug.placeholder_file_access_detected = debug.placeholder_file_access_detected || placeholderDetected;
+    if (placeholderDetected) {
+      validation = {
+        passed: false,
+        warnings: [],
+        failures: ['Generated code uses placeholder file access (e.g., data.csv).'],
+        rows_input: getInputRowCount(csvText),
+        rows_output: 0,
+        duplicates_removed: null,
+        dates_normalized: null
+      };
+      logs.push('Validation failed: placeholder file access detected. Retrying with correction instructions...');
+      correctionMessage =
+        'You must use the inline CSV content already provided. Do not use external filenames. Return actual cleaned CSV text and structured JSON only.';
       continue;
     }
 
@@ -349,12 +418,24 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
     allWarnings.push(...finalPayload.warnings);
     allWarnings.push(...validation.warnings);
 
+    const genericSummary = isGenericSummary(
+      finalPayload.summary,
+      validation.rows_input ?? getInputRowCount(csvText),
+      validation.rows_output ?? 0
+    );
+    if (genericSummary) {
+      validation.failures.push('Summary appears generic or ungrounded in actual row counts.');
+    }
+    validation.passed = validation.failures.length === 0;
+
     if (validation.passed) {
       logs.push('Validation passed. Preparing final response...');
       break;
     }
 
     logs.push(`Validation failed: ${validation.failures.join(' ')} Retrying...`);
+    correctionMessage =
+      'You must use the inline CSV content already provided. Do not use external filenames. Return actual cleaned CSV text and structured JSON only.';
   }
 
   if (!finalPayload && finalText) {
@@ -431,6 +512,7 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
   }
 
   const cleanedCsvText = (finalPayload.cleaned_csv || '').trim();
+  debug.cleaned_csv_empty = !cleanedCsvText;
   const summary = finalPayload.summary ? `Summary:\n${finalPayload.summary}` : 'Summary:\nNo summary returned.';
   const result = `${cleanedCsvText}\n\n${summary}`.trim();
 
@@ -461,6 +543,9 @@ export async function executeDynamicCsvTask({ task, fileBuffer, apiKey, model })
       dynamic_code_used: codeToolUsed
     },
     artifacts: {
+      cleaned_csv: cleanedCsvText || undefined,
+      anomalies: finalPayload.anomalies?.length ? finalPayload.anomalies : undefined,
+      per_user_summary: finalPayload.per_user_summary || undefined,
       generated_code: finalPayload.generated_code_excerpt
         ? String(finalPayload.generated_code_excerpt).slice(0, 1200)
         : fallbackArtifacts.generated_code || undefined,
